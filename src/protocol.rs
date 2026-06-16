@@ -16,25 +16,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProtocolVersion(u32);
-
-impl ProtocolVersion {
-    pub const CURRENT: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION);
-
-    pub fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    pub fn get(self) -> u32 {
-        self.0
-    }
-
-    pub fn is_compatible(self) -> bool {
-        self.0 == PROTOCOL_VERSION
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(Uuid);
 
@@ -128,6 +109,13 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
     let body = encode(message)?;
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(Error::Daemon(format!(
+            "frame too large: {} bytes (max {})",
+            body.len(),
+            MAX_FRAME_BYTES
+        )));
+    }
     let len = u32::try_from(body.len())
         .map_err(|_| Error::Daemon(format!("frame too large: {} bytes", body.len())))?;
     writer.write_all(&len.to_be_bytes())?;
@@ -246,16 +234,31 @@ mod tests {
     }
 
     #[test]
+    fn write_frame_rejects_a_body_exceeding_the_max() {
+        let oversized = Request::Set {
+            namespace: "prod".to_owned(),
+            query: "q".to_owned(),
+            keys: vec![],
+            context: None,
+            value: serde_bytes::ByteBuf::from(vec![0u8; MAX_FRAME_BYTES + 1]),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let err = write_frame(&mut buf, &oversized).unwrap_err();
+        assert!(
+            matches!(err, Error::Daemon(ref msg) if msg.contains("frame too large")),
+            "expected Error::Daemon frame-too-large, got {err:?}"
+        );
+        assert!(
+            buf.is_empty(),
+            "write_frame must fail before writing the length prefix"
+        );
+    }
+
+    #[test]
     fn client_id_round_trips_without_uuid_serde_feature() {
         let id = ClientId::generate();
         let bytes = encode(&id).unwrap();
         let back: ClientId = decode(&bytes).unwrap();
         assert_eq!(id, back);
-    }
-
-    #[test]
-    fn protocol_version_compatibility() {
-        assert!(ProtocolVersion::CURRENT.is_compatible());
-        assert!(!ProtocolVersion::new(PROTOCOL_VERSION + 1).is_compatible());
     }
 }

@@ -32,7 +32,7 @@ pub fn connect_or_spawn(launcher: &Launcher) -> Result<ClientStub> {
     // so the first `hello` reads EOF. Reconnecting respawns the daemon transparently.
     match stub.hello() {
         Ok(()) => Ok(stub),
-        Err(Error::Io(_) | Error::Codec(_)) => {
+        Err(error) if is_transient_drop(&error) => {
             stub.reconnect()?;
             Ok(stub)
         }
@@ -45,6 +45,36 @@ fn dead_socket(error: &std::io::Error) -> bool {
         error.kind(),
         ErrorKind::NotFound | ErrorKind::ConnectionRefused
     )
+}
+
+// Only a dropped connection or a corrupt frame warrants a transparent reconnect;
+// every other variant — a protocol version mismatch above all — is fatal and must
+// surface as itself rather than being retried or masked into `DaemonShutdown`.
+fn is_transient_drop(error: &Error) -> bool {
+    match error {
+        Error::Io(_) | Error::Codec(_) => true,
+        Error::EmptyQuery
+        | Error::EmptyContext
+        | Error::EmptyKey
+        | Error::EmptyEntity
+        | Error::EmptyNamespace
+        | Error::InvalidNamespace(_)
+        | Error::EmptyEmbedding
+        | Error::ZeroEmbedding
+        | Error::NonFiniteEmbedding
+        | Error::DimMismatch { .. }
+        | Error::MissingEnv(_)
+        | Error::UnknownBackend(_)
+        | Error::InvalidConfig(_)
+        | Error::NamespaceMissing(_)
+        | Error::EntityExtraction(_)
+        | Error::Embedding(_)
+        | Error::VectorStorage(_)
+        | Error::ObjectStorage(_)
+        | Error::DaemonShutdown
+        | Error::Daemon(_)
+        | Error::ProtocolVersionMismatch { .. } => false,
+    }
 }
 
 fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
@@ -130,9 +160,9 @@ impl ClientStub {
     pub fn request(&mut self, request: &Request) -> Result<Response> {
         match self.round_trip(request) {
             Ok(response) => Ok(response),
-            Err(Error::Io(_) | Error::Codec(_)) => {
-                self.reconnect().map_err(|_| Error::DaemonShutdown)?;
-                self.round_trip(request).map_err(|_| Error::DaemonShutdown)
+            Err(error) if is_transient_drop(&error) => {
+                self.reconnect()?;
+                self.round_trip(request)
             }
             Err(other) => Err(other),
         }
@@ -151,5 +181,37 @@ impl ClientStub {
             Response::Goodbye => Ok(()),
             other => Err(Error::Daemon(format!("expected Goodbye, got {other:?}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error as IoError, ErrorKind};
+
+    use super::is_transient_drop;
+    use crate::error::Error;
+
+    #[test]
+    fn io_and_codec_failures_are_transient_drops() {
+        let io = Error::Io(IoError::new(ErrorKind::BrokenPipe, "peer hung up"));
+        let codec = Error::Codec(postcard::from_bytes::<u32>(&[]).unwrap_err());
+        assert!(is_transient_drop(&io));
+        assert!(is_transient_drop(&codec));
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_fatal_not_transient() {
+        let mismatch = Error::ProtocolVersionMismatch {
+            client: 1,
+            daemon: 2,
+        };
+        assert!(!is_transient_drop(&mismatch));
+    }
+
+    #[test]
+    fn lifecycle_and_validation_errors_are_not_transient_drops() {
+        assert!(!is_transient_drop(&Error::DaemonShutdown));
+        assert!(!is_transient_drop(&Error::Daemon("listener gone".into())));
+        assert!(!is_transient_drop(&Error::EmptyQuery));
     }
 }

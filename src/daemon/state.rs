@@ -80,6 +80,10 @@ pub(super) struct NamespaceEntry {
 
 pub(super) struct DaemonState {
     registry: RwLock<HashMap<String, Arc<NamespaceEntry>>>,
+    // Serializes registration per namespace name so a namespace's (expensive) cache build
+    // runs at most once: concurrent registrations of the same name queue on its lock, and
+    // all but the first observe the already-registered entry and skip the build.
+    build_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(super) inference: InferencePool,
     pub(super) writer: WriteQueue,
 }
@@ -88,6 +92,7 @@ impl DaemonState {
     pub(super) fn new() -> Self {
         Self {
             registry: RwLock::new(HashMap::new()),
+            build_locks: Mutex::new(HashMap::new()),
             inference: InferencePool::new(),
             writer: WriteQueue::new(WRITE_QUEUE_CAPACITY, WRITE_WORKERS),
         }
@@ -108,6 +113,21 @@ impl DaemonState {
             .map_err(|_| Error::Daemon("registry lock poisoned".to_owned()))?;
         registry.insert(namespace, entry);
         Ok(())
+    }
+
+    /// The per-namespace build lock, created on first request and stable thereafter. A
+    /// registration holds this across the resolve-build-register sequence so a second
+    /// registration of the same namespace waits, then resolves the first one's entry
+    /// instead of rebuilding.
+    pub(super) fn build_lock(&self, namespace: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut build_locks = self
+            .build_locks
+            .lock()
+            .map_err(|_| Error::Daemon("build-locks lock poisoned".to_owned()))?;
+        Ok(build_locks
+            .entry(namespace.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
     }
 }
 
@@ -169,6 +189,23 @@ mod tests {
         // The current value clears itself.
         assert!(pending.remove_if(&key, &v2).unwrap());
         assert!(pending.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_lock_is_stable_per_namespace() {
+        let state = DaemonState::new();
+        let alpha = state.build_lock("alpha").unwrap();
+        let alpha_again = state.build_lock("alpha").unwrap();
+        let beta = state.build_lock("beta").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&alpha, &alpha_again),
+            "the same namespace reuses one build lock so its cache builds at most once"
+        );
+        assert!(
+            !Arc::ptr_eq(&alpha, &beta),
+            "distinct namespaces get independent build locks"
+        );
     }
 
     #[test]

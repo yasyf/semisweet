@@ -18,6 +18,8 @@ const API_BASE_ENV: &str = "TURBOPUFFER_API_BASE";
 const DEFAULT_BASE_URL: &str = "https://api.turbopuffer.com";
 const DEFAULT_NAMESPACE_PREFIX: &str = "semisweet-";
 const DISTANCE_METRIC: &str = "cosine_distance";
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct QueryResponse {
@@ -28,7 +30,7 @@ struct QueryResponse {
 #[derive(Deserialize)]
 struct QueryRow {
     id: String,
-    #[serde(rename = "$dist", default)]
+    #[serde(rename = "$dist")]
     dist: f32,
     #[serde(default)]
     entities: Vec<String>,
@@ -48,21 +50,22 @@ impl TurbopufferVectorStore {
     pub fn new() -> Result<Self> {
         let api_key = std::env::var(API_KEY_ENV).map_err(|_| Error::MissingEnv(API_KEY_ENV))?;
         let base_url = std::env::var(API_BASE_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-        Ok(Self::from_parts(
-            api_key,
-            base_url,
-            DEFAULT_NAMESPACE_PREFIX.to_owned(),
-        ))
+        Self::from_parts(api_key, base_url, DEFAULT_NAMESPACE_PREFIX.to_owned())
     }
 
-    fn from_parts(api_key: String, base_url: String, namespace_prefix: String) -> Self {
-        Self {
-            client: Client::new(),
+    fn from_parts(api_key: String, base_url: String, namespace_prefix: String) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| Error::VectorStorage(Box::new(e)))?;
+        Ok(Self {
+            client,
             api_key,
             base_url,
             namespace_prefix,
             dims: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     fn physical_namespace(&self, ns: &Namespace) -> String {
@@ -157,9 +160,19 @@ impl VectorStorageBackend for TurbopufferVectorStore {
             return self.cache_dim(ns, dim);
         }
         if status.is_client_error() && is_dimension_error(&text) {
-            return Err(Error::DimMismatch {
-                got: dim.get(),
-                want: cached.unwrap_or(dim).get(),
+            return Err(match cached {
+                Some(want) => Error::DimMismatch {
+                    got: dim.get(),
+                    want: want.get(),
+                },
+                None => Error::VectorStorage(
+                    format!(
+                        "turbopuffer rejected upsert dimension {} for namespace `{}`; expected remote dimension unknown: {text}",
+                        dim.get(),
+                        self.physical_namespace(ns)
+                    )
+                    .into(),
+                ),
             });
         }
         Err(Error::VectorStorage(
@@ -200,9 +213,18 @@ impl VectorStorageBackend for TurbopufferVectorStore {
         }
         if !status.is_success() {
             if status.is_client_error() && is_dimension_error(&text) {
-                return Err(Error::DimMismatch {
-                    got: vector.dim().get(),
-                    want: self.cached_dim(ns)?.unwrap_or(vector.dim()).get(),
+                return Err(match self.cached_dim(ns)? {
+                    Some(want) => Error::DimMismatch {
+                        got: vector.dim().get(),
+                        want: want.get(),
+                    },
+                    None => Error::VectorStorage(
+                        format!(
+                            "turbopuffer rejected query dimension {}; expected remote dimension unknown: {text}",
+                            vector.dim().get()
+                        )
+                        .into(),
+                    ),
                 });
             }
             return Err(Error::VectorStorage(
@@ -280,9 +302,16 @@ fn row_to_hit(row: QueryRow) -> Result<ScoredHit> {
     })
 }
 
+// turbopuffer exposes no stable structured error code or field for a vector
+// dimension conflict — its `/v2` 4xx bodies carry only a human-readable message
+// — so this is a best-effort classification of that text. Callers must gate on a
+// 4xx status so a transient 5xx is never read as a dimension error. We match the
+// explicit "dimension" wording, and only treat a "schema" rejection as
+// dimension-related when it also names the "vector" field, so an unrelated schema
+// error on another attribute is not misclassified.
 fn is_dimension_error(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("dimension") || lower.contains("schema")
+    lower.contains("dimension") || (lower.contains("schema") && lower.contains("vector"))
 }
 
 #[cfg(test)]
@@ -305,6 +334,7 @@ mod tests {
             server.base_url(),
             DEFAULT_NAMESPACE_PREFIX.to_owned(),
         )
+        .unwrap()
     }
 
     fn entry_with_dim(values: Vec<f32>) -> VectorEntry {
@@ -474,6 +504,80 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         );
         assert_eq!(hits[0].context.as_ref().map(|c| c.as_str()), Some("ctx"));
+    }
+
+    #[test]
+    fn query_row_missing_dist_is_error() {
+        let server = MockServer::start();
+        let store = store_for(&server);
+        let row_id = EntryId::derive(
+            &QueryText::new("dose".to_owned()).unwrap(),
+            &[Key::new("k1".to_owned()).unwrap()].into_iter().collect(),
+        );
+        let response = json!({
+            "rows": [{
+                "id": row_id.to_string(),
+                "entities": ["aspirin"],
+                "keys": ["k1"],
+                "context": "ctx",
+            }],
+        });
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v2/namespaces/semisweet-ns/query");
+            then.status(200).json_body(response);
+        });
+
+        let vector = Embedding::new(vec![0.0, 1.0]).unwrap();
+        let err = store
+            .query(
+                &namespace(),
+                &vector,
+                &Filter::default(),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap_err();
+        mock.assert();
+        assert!(matches!(err, Error::VectorStorage(_)));
+    }
+
+    #[test]
+    fn query_dimension_error_without_cached_dim_is_storage_error() {
+        let server = MockServer::start();
+        let store = store_for(&server);
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v2/namespaces/semisweet-ns/query");
+            then.status(400)
+                .body("vector dimension 2 does not match index dimension 768");
+        });
+
+        let vector = Embedding::new(vec![0.0, 1.0]).unwrap();
+        let err = store
+            .query(
+                &namespace(),
+                &vector,
+                &Filter::default(),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .unwrap_err();
+        mock.assert();
+        assert!(matches!(err, Error::VectorStorage(_)));
+    }
+
+    #[test]
+    fn upsert_dimension_error_without_cached_dim_is_storage_error() {
+        let server = MockServer::start();
+        let store = store_for(&server);
+        let mock = server.mock(|when, then| {
+            when.method(POST).path(PHYSICAL_PATH);
+            then.status(400)
+                .body("vector dimension 2 does not match index dimension 768");
+        });
+
+        let err = store
+            .upsert(&namespace(), entry_with_dim(vec![0.0, 1.0]))
+            .unwrap_err();
+        mock.assert();
+        assert!(matches!(err, Error::VectorStorage(_)));
     }
 
     #[test]

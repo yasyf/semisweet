@@ -205,10 +205,6 @@ mod tests {
         fn embed_query(&self, text: &str) -> Result<Embedding> {
             Embedding::new(self.vectors.get(text).expect("query registered").clone())
         }
-
-        fn embed_document(&self, text: &str) -> Result<Embedding> {
-            Embedding::new(self.vectors.get(text).expect("document registered").clone())
-        }
     }
 
     struct FakeEntity {

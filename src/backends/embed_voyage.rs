@@ -2,8 +2,8 @@
 //!
 //! Thin wrapper over Voyage AI's `/v1/embeddings` endpoint using a blocking
 //! `reqwest` client. Mirrors the request contract bioqa uses: a single-element
-//! `input` array, an explicit `input_type` (`query`/`document`), the configured
-//! `output_dimension`, and `output_dtype: "float"`.
+//! `input` array, the `query` `input_type`, the configured `output_dimension`,
+//! and `output_dtype: "float"`.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -19,6 +19,8 @@ const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const API_KEY_ENV: &str = "VOYAGE_API_KEY";
 const BASE_URL_ENV: &str = "VOYAGE_API_BASE";
 const OUTPUT_DTYPE: &str = "float";
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 enum VoyageError {
@@ -71,8 +73,13 @@ impl VoyageEmbedding {
     pub fn new(model: String, output_dimension: NonZeroUsize) -> Result<Self> {
         let api_key = std::env::var(API_KEY_ENV).map_err(|_| Error::MissingEnv(API_KEY_ENV))?;
         let base_url = std::env::var(BASE_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| Error::Embedding(Box::new(e)))?;
         Ok(Self {
-            client: Client::new(),
+            client,
             api_key,
             model,
             dim: Dim::new(output_dimension.get())?,
@@ -80,11 +87,11 @@ impl VoyageEmbedding {
         })
     }
 
-    fn embed(&self, text: &str, input_type: &str) -> Result<Embedding> {
+    fn embed(&self, text: &str) -> Result<Embedding> {
         let request = EmbeddingRequest {
             input: [text],
             model: &self.model,
-            input_type,
+            input_type: "query",
             output_dimension: self.dim.get(),
             output_dtype: OUTPUT_DTYPE,
         };
@@ -123,11 +130,7 @@ impl EmbeddingBackend for VoyageEmbedding {
     }
 
     fn embed_query(&self, text: &str) -> Result<Embedding> {
-        self.embed(text, "query")
-    }
-
-    fn embed_document(&self, text: &str) -> Result<Embedding> {
-        self.embed(text, "document")
+        self.embed(text)
     }
 }
 
@@ -184,27 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn embed_document_sends_document_input_type() {
-        let server = MockServer::start();
-        let mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/embeddings").json_body(json!({
-                "input": ["aspirin is an nsaid"],
-                "model": "voyage-3.5-lite",
-                "input_type": "document",
-                "output_dimension": 2,
-                "output_dtype": "float",
-            }));
-            then.status(200)
-                .json_body(json!({ "data": [{ "embedding": [1.0, 0.0], "index": 0 }] }));
-        });
-
-        let backend = test_backend(&server, 2);
-        backend.embed_document("aspirin is an nsaid").unwrap();
-
-        mock.assert();
-    }
-
-    #[test]
     fn data_is_sorted_by_index_before_taking_first() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
@@ -234,7 +216,7 @@ mod tests {
         });
 
         let backend = test_backend(&server, 2);
-        let err = backend.embed_document("x").unwrap_err();
+        let err = backend.embed_query("x").unwrap_err();
 
         mock.assert();
         assert!(matches!(err, Error::Embedding(_)));

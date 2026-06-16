@@ -73,10 +73,6 @@ impl EmbeddingBackend for LocalEmbedding {
     fn embed_query(&self, text: &str) -> Result<Embedding> {
         self.embed_one(&format!("{}{text}", self.query_instruction))
     }
-
-    fn embed_document(&self, text: &str) -> Result<Embedding> {
-        self.embed_one(text)
-    }
 }
 
 #[cfg(test)]
@@ -89,25 +85,13 @@ mod tests {
         let backend = LocalEmbedding::new(None).expect("model init");
         assert_eq!(backend.dim().get(), MODEL_DIM);
 
-        let first = backend
-            .embed_document("hello world")
-            .expect("embed document");
+        let first = backend.embed_query("hello world").expect("embed query");
         assert_eq!(first.dim().get(), MODEL_DIM);
 
         let norm = first.values().iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
 
-        let again = backend
-            .embed_document("hello world")
-            .expect("re-embed document");
+        let again = backend.embed_query("hello world").expect("re-embed query");
         assert_eq!(first.values(), again.values());
-
-        let query = backend.embed_query("hello world").expect("embed query");
-        assert_eq!(query.dim().get(), MODEL_DIM);
-        let query_norm = query.values().iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (query_norm - 1.0).abs() < 1e-5,
-            "query norm was {query_norm}"
-        );
     }
 }

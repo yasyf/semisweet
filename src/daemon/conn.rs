@@ -26,6 +26,26 @@ use crate::registry::{self, NamespaceConfig};
 type Conn = Framed<UnixStream, LengthDelimitedCodec>;
 type Parts = (QueryText, BTreeSet<Key>, Option<Context>);
 
+/// Pairs the connection refcount across the serve task's whole life: sends `Connected`
+/// when constructed (after a successful handshake) and `Disconnected` on drop, so an
+/// early return or panic still decrements the count.
+struct ConnectionGuard {
+    events: UnboundedSender<ClientEvent>,
+}
+
+impl ConnectionGuard {
+    fn enter(events: UnboundedSender<ClientEvent>) -> Self {
+        let _ = events.send(ClientEvent::Connected);
+        Self { events }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let _ = self.events.send(ClientEvent::Disconnected);
+    }
+}
+
 pub(super) async fn serve(
     stream: UnixStream,
     events: UnboundedSender<ClientEvent>,
@@ -44,9 +64,8 @@ pub(super) async fn serve(
         Ok(true) => {}
         Ok(false) | Err(_) => return,
     }
-    let _ = events.send(ClientEvent::Connected);
+    let _guard = ConnectionGuard::enter(events);
     let _ = message_loop(&mut framed, &state, &daemon_version, protocol).await;
-    let _ = events.send(ClientEvent::Disconnected);
 }
 
 async fn handshake(framed: &mut Conn, daemon_version: &str, protocol: u32) -> Result<bool> {
@@ -140,6 +159,14 @@ async fn handle_register(
     namespace: String,
     config_json: String,
 ) -> Response {
+    // Held across the resolve-build-register sequence so the namespace builds at most
+    // once: a concurrent registration of the same name blocks here, then resolves the
+    // first registration's entry below instead of building a duplicate cache.
+    let build_lock = match state.build_lock(&namespace) {
+        Ok(build_lock) => build_lock,
+        Err(error) => return backend_error(error),
+    };
+    let _build_guard = build_lock.lock().await;
     match state.resolve(&namespace) {
         Ok(Some(_)) => return Response::Registered,
         Ok(None) => {}
@@ -159,7 +186,7 @@ async fn handle_register(
         .run(move || registry::build_cache(&build_namespace, &config))
         .await;
     match built {
-        Ok(cache) => {
+        Ok(Ok(cache)) => {
             let entry = Arc::new(NamespaceEntry {
                 cache: Arc::new(cache),
                 pending: Arc::new(PendingWrites::default()),
@@ -169,7 +196,8 @@ async fn handle_register(
                 Err(error) => backend_error(error),
             }
         }
-        Err(error) => Response::Error(ProtocolError::BackendInit(error.to_string())),
+        // Either the build failed (inner) or the pool is shutting down (outer).
+        Ok(Err(error)) | Err(error) => backend_error(error),
     }
 }
 
@@ -204,8 +232,8 @@ async fn handle_get(
         .run(move || cache.get(&query, &keys, &context))
         .await
     {
-        Ok(value) => Response::Value(value.map(serde_bytes::ByteBuf::from)),
-        Err(error) => backend_error(error),
+        Ok(Ok(value)) => Response::Value(value.map(serde_bytes::ByteBuf::from)),
+        Ok(Err(error)) | Err(error) => backend_error(error),
     }
 }
 
@@ -239,13 +267,14 @@ fn handle_set(
         query,
         keys,
         context,
-        value,
+        value: value.clone(),
     };
     let accepted = state.writer.try_push(job);
     if !accepted {
         // The bounded queue is full, so this write will never run; drop the shadow
-        // rather than advertise a read-after-write hit that never lands.
-        if let Err(error) = entry.pending.remove(&id) {
+        // rather than advertise a read-after-write hit that never lands. `remove_if` so a
+        // concurrent accepted same-id write's (different-Arc) shadow is never dropped.
+        if let Err(error) = entry.pending.remove_if(&id, &value) {
             return backend_error(error);
         }
     }
@@ -284,8 +313,8 @@ async fn handle_del(
         .run(move || cache.delete(&query, &keys, &context))
         .await
     {
-        Ok(deleted) => Response::Deleted(removed_pending || deleted),
-        Err(error) => backend_error(error),
+        Ok(Ok(deleted)) => Response::Deleted(removed_pending || deleted),
+        Ok(Err(error)) | Err(error) => backend_error(error),
     }
 }
 
@@ -331,7 +360,34 @@ fn invalid_request(error: Error) -> Response {
 }
 
 fn backend_error(error: Error) -> Response {
-    Response::Error(ProtocolError::BackendInit(error.to_string()))
+    let protocol_error = match error {
+        Error::EmptyQuery
+        | Error::EmptyContext
+        | Error::EmptyKey
+        | Error::EmptyEntity
+        | Error::EmptyNamespace
+        | Error::InvalidNamespace(_)
+        | Error::EmptyEmbedding
+        | Error::ZeroEmbedding
+        | Error::NonFiniteEmbedding
+        | Error::DimMismatch { .. }
+        | Error::MissingEnv(_)
+        | Error::UnknownBackend(_)
+        | Error::InvalidConfig(_) => ProtocolError::InvalidRequest(error.to_string()),
+        Error::NamespaceMissing(namespace) => ProtocolError::UnknownNamespace(namespace),
+        Error::ProtocolVersionMismatch { client, daemon } => {
+            ProtocolError::VersionMismatch { client, daemon }
+        }
+        Error::EntityExtraction(_)
+        | Error::Embedding(_)
+        | Error::VectorStorage(_)
+        | Error::ObjectStorage(_)
+        | Error::DaemonShutdown
+        | Error::Daemon(_)
+        | Error::Io(_)
+        | Error::Codec(_) => ProtocolError::BackendInit(error.to_string()),
+    };
+    Response::Error(protocol_error)
 }
 
 async fn send(framed: &mut Conn, response: &Response) -> Result<()> {
