@@ -113,6 +113,65 @@ def test_delete_removes_entry(runtime):
     assert cache.get(query) is None
 
 
+@needs_model
+def test_large_payload_offloads_and_roundtrips_exact_bytes(runtime):
+    cache = _local_cache("largepayload", runtime)
+    query = CacheQuery("summarize the quarterly earnings report", set())
+    # 5 MiB exercises the on-disk object store and the 64 MiB IPC framing end to
+    # end; the payload travels Python -> daemon -> object store -> back, intact.
+    payload = os.urandom(5 * 1024 * 1024)
+
+    assert cache.set(query, payload) is True
+    got = _poll_get(cache, query)
+    assert got is not None
+    assert len(got) == 5 * 1024 * 1024
+    assert got == payload
+
+
+@needs_model
+def test_context_assisted_hit_roundtrips(runtime):
+    cache = _local_cache("context", runtime)
+    query = CacheQuery(
+        "what dose should the patient take",
+        set(),
+        "patient is currently on warfarin therapy",
+    )
+
+    assert cache.set(query, b"5mg daily") is True
+    assert _poll_get(cache, query) == b"5mg daily"
+
+
+@needs_model
+def test_keys_filter_isolates_entries_for_same_query(runtime):
+    cache = _local_cache("keys", runtime)
+    text = "what is the patient's current medication"
+    v1 = CacheQuery(text, {"v1"})
+    v2 = CacheQuery(text, {"v2"})
+
+    # Same query text, disjoint `keys` sets: the deterministic id keys on
+    # query+keys, so these are two distinct entries the keys filter keeps apart.
+    assert cache.set(v1, b"aspirin") is True
+    assert cache.set(v2, b"ibuprofen") is True
+
+    assert _poll_get(cache, v1) == b"aspirin"
+    assert _poll_get(cache, v2) == b"ibuprofen"
+
+
+@needs_model
+def test_distinct_namespaces_isolate_entries(runtime):
+    # Two caches share one daemon and object root but use different namespaces;
+    # the same query+keys yields the same id, so only namespacing keeps them apart.
+    cache_alpha = _local_cache("alpha", runtime)
+    cache_beta = _local_cache("beta", runtime)
+    query = CacheQuery("what is the capital of france", set())
+
+    assert cache_alpha.set(query, b"paris") is True
+    assert cache_beta.set(query, b"berlin") is True
+
+    assert _poll_get(cache_alpha, query) == b"paris"
+    assert _poll_get(cache_beta, query) == b"berlin"
+
+
 def test_builder_floor_above_base_raises():
     builder = (
         SemanticCache.builder("ns")
