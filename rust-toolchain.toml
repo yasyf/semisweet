@@ -1,0 +1,6 @@
+[toolchain]
+# rust-s3 0.37 (let-chains) and the dev-deps (httpmock, testcontainers) require
+# rustc >= 1.88; pin a known-good stable so `cargo` Just Works regardless of the
+# machine's default toolchain. Phase 5 reconciles Cargo.toml `rust-version`.
+channel = "1.90.0"
+components = ["clippy", "rustfmt"]

@@ -21,3 +21,6 @@ __pycache__/
 /target
 # Cargo.lock is intentionally committed (this crate ships a wheel; reproducible
 # builds) — do not ignore it.
+
+# Downloaded model caches (regenerable; fastembed/ONNX weights)
+.fastembed_cache/
