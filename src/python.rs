@@ -10,8 +10,9 @@
 //! serde `*Choice` config the daemon understands. Every argument is optional; an
 //! omitted axis falls back to the fully-local default.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -47,6 +48,118 @@ fn register(
     Ok((stub, response))
 }
 
+fn py_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
+fn render_opt_str(value: &Option<String>) -> String {
+    match value {
+        Some(value) => format!("'{value}'"),
+        None => "None".to_owned(),
+    }
+}
+
+fn render_opt<T: fmt::Display>(value: &Option<T>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "None".to_owned(),
+    }
+}
+
+fn render_str_list(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+// Keys are an unordered set: render them sorted so the repr (and the hash derived
+// from it) is canonical regardless of the set's iteration order.
+fn render_str_set(values: &[String]) -> String {
+    if values.is_empty() {
+        return "set()".to_owned();
+    }
+    let mut sorted: Vec<&String> = values.iter().collect();
+    sorted.sort();
+    let items = sorted
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{items}}}")
+}
+
+fn hash_str(value: &str) -> isize {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish() as isize
+}
+
+fn embedding_repr(choice: &EmbeddingChoice) -> String {
+    match choice {
+        EmbeddingChoice::Local { model } => {
+            format!("LocalEmbedding(model={})", render_opt_str(model))
+        }
+        EmbeddingChoice::Voyage { model, dim } => format!(
+            "VoyageEmbedding(model={}, dim={})",
+            render_opt_str(model),
+            render_opt(dim)
+        ),
+    }
+}
+
+fn entity_repr(choice: &EntityChoice) -> String {
+    match choice {
+        EntityChoice::Keyword { language } => {
+            format!("KeywordEntities(lang={})", render_opt_str(language))
+        }
+        EntityChoice::Gliner {
+            labels,
+            repo,
+            model,
+            tokenizer,
+        } => format!(
+            "GlinerEntities(labels={}, repo={}, model={}, tokenizer={})",
+            render_str_list(labels),
+            render_opt_str(repo),
+            render_opt_str(model),
+            render_opt_str(tokenizer)
+        ),
+    }
+}
+
+fn vector_repr(choice: &VectorChoice) -> String {
+    match choice {
+        VectorChoice::Memory => "MemoryVectors()".to_owned(),
+        VectorChoice::Turbopuffer => "TurbopufferVectors()".to_owned(),
+    }
+}
+
+fn object_repr(choice: &ObjectChoice) -> String {
+    match choice {
+        ObjectChoice::Disk { root } => format!("DiskStorage(root={})", render_opt_str(root)),
+        ObjectChoice::S3 {
+            bucket,
+            region,
+            endpoint,
+            prefix,
+        } => format!(
+            "S3Storage(bucket={}, region={}, endpoint={}, prefix='{prefix}')",
+            render_opt_str(bucket),
+            render_opt_str(region),
+            render_opt_str(endpoint)
+        ),
+    }
+}
+
+/// A frozen, hashable cache lookup: a natural-language `query` plus an optional set
+/// of entity `keys` and optional `context`. Keys are treated as an unordered set, so
+/// two queries with the same query text, key set, and context compare and hash equal.
+///
+/// Keyword-only args: `query` (str, required), `keys` (set[str]), `context` (str).
+/// Raises `ConfigError` if the query, any key, or the context is empty or invalid.
 #[pyclass(name = "CacheQuery", frozen)]
 pub(crate) struct PyCacheQuery {
     query: String,
@@ -75,10 +188,39 @@ impl PyCacheQuery {
             context,
         })
     }
+
+    /// Render the configured query, key set, and context.
+    fn __repr__(&self) -> String {
+        format!(
+            "CacheQuery(query='{}', keys={}, context={})",
+            self.query,
+            render_str_set(&self.keys),
+            render_opt_str(&self.context)
+        )
+    }
+
+    /// Value equality: equal query text, equal context, and the same set of keys.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.query == other.query
+            && self.context == other.context
+            && self.keys.iter().collect::<HashSet<_>>()
+                == other.keys.iter().collect::<HashSet<_>>()
+    }
+
+    /// Hash consistent with `__eq__` (keys hashed as a set).
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
 // --- Embedding backends ---
 
+/// Embedding backend that runs a sentence-transformer model in-process.
+///
+/// Keyword-only arg: `model` (str Hugging Face repo id; defaults to the daemon's
+/// built-in model). On a cold cache the first use triggers a BLOCKING model download
+/// from Hugging Face; set the `SEMISWEET_MODEL_CACHE` env var to control where the
+/// weights are cached.
 #[pyclass(name = "LocalEmbedding", frozen)]
 pub(crate) struct PyLocalEmbedding {
     choice: EmbeddingChoice,
@@ -93,8 +235,28 @@ impl PyLocalEmbedding {
             choice: EmbeddingChoice::Local { model },
         }
     }
+
+    /// Render the configured model.
+    fn __repr__(&self) -> String {
+        embedding_repr(&self.choice)
+    }
+
+    /// Value equality: same configured model.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
+/// Embedding backend backed by the Voyage AI API.
+///
+/// Keyword-only args: `model` (str) and `dim` (int output dimension); both default to
+/// the daemon's defaults. Requires `VOYAGE_API_KEY` in the daemon's environment — a
+/// missing key surfaces as `ConfigError` when the namespace is registered.
 #[pyclass(name = "VoyageEmbedding", frozen)]
 pub(crate) struct PyVoyageEmbedding {
     choice: EmbeddingChoice,
@@ -108,6 +270,21 @@ impl PyVoyageEmbedding {
         Self {
             choice: EmbeddingChoice::Voyage { model, dim },
         }
+    }
+
+    /// Render the configured model and dimension.
+    fn __repr__(&self) -> String {
+        embedding_repr(&self.choice)
+    }
+
+    /// Value equality: same configured model and dimension.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
     }
 }
 
@@ -128,6 +305,9 @@ impl EmbeddingArg<'_> {
 
 // --- Entity backends ---
 
+/// Entity backend that extracts keyword entities with no model download.
+///
+/// Keyword-only arg: `lang` (str language code; defaults to the daemon's default).
 #[pyclass(name = "KeywordEntities", frozen)]
 pub(crate) struct PyKeywordEntities {
     choice: EntityChoice,
@@ -142,8 +322,31 @@ impl PyKeywordEntities {
             choice: EntityChoice::Keyword { language: lang },
         }
     }
+
+    /// Render the configured language.
+    fn __repr__(&self) -> String {
+        entity_repr(&self.choice)
+    }
+
+    /// Value equality: same configured language.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
+/// Entity backend backed by a GLiNER ONNX model.
+///
+/// Keyword-only args: `labels` (list[str] of entity types to extract; defaults to
+/// person/organization/location/date/product/event), `repo` (str Hugging Face repo
+/// id), `model` (str explicit ONNX path) and `tokenizer` (str explicit tokenizer.json
+/// path). Unless explicit `model`/`tokenizer` paths are given, the first use on a cold
+/// cache triggers a BLOCKING model download from Hugging Face; set the
+/// `SEMISWEET_MODEL_CACHE` env var to control where the weights are cached.
 #[pyclass(name = "GlinerEntities", frozen)]
 pub(crate) struct PyGlinerEntities {
     choice: EntityChoice,
@@ -174,6 +377,21 @@ impl PyGlinerEntities {
             },
         }
     }
+
+    /// Render the configured labels, repo, and model/tokenizer paths.
+    fn __repr__(&self) -> String {
+        entity_repr(&self.choice)
+    }
+
+    /// Value equality: same configured labels, repo, and model/tokenizer paths.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
 #[derive(FromPyObject)]
@@ -193,6 +411,8 @@ impl EntityArg<'_> {
 
 // --- Vector index backends ---
 
+/// In-process vector index. Vectors live only for the lifetime of the daemon and are
+/// lost when it shuts down. Takes no arguments.
 #[pyclass(name = "MemoryVectors", frozen)]
 pub(crate) struct PyMemoryVectors {
     choice: VectorChoice,
@@ -206,8 +426,25 @@ impl PyMemoryVectors {
             choice: VectorChoice::Memory,
         }
     }
+
+    /// Render the backend.
+    fn __repr__(&self) -> String {
+        vector_repr(&self.choice)
+    }
+
+    /// Value equality: all instances are equal.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
+/// Vector index backed by turbopuffer. Requires turbopuffer credentials in the
+/// daemon's environment. Takes no arguments.
 #[pyclass(name = "TurbopufferVectors", frozen)]
 pub(crate) struct PyTurbopufferVectors {
     choice: VectorChoice,
@@ -220,6 +457,21 @@ impl PyTurbopufferVectors {
         Self {
             choice: VectorChoice::Turbopuffer,
         }
+    }
+
+    /// Render the backend.
+    fn __repr__(&self) -> String {
+        vector_repr(&self.choice)
+    }
+
+    /// Value equality: all instances are equal.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
     }
 }
 
@@ -240,6 +492,9 @@ impl VectorArg<'_> {
 
 // --- Object storage backends ---
 
+/// Object storage on the local filesystem.
+///
+/// Keyword-only arg: `root` (str directory; defaults to the daemon's data directory).
 #[pyclass(name = "DiskStorage", frozen)]
 pub(crate) struct PyDiskStorage {
     choice: ObjectChoice,
@@ -254,8 +509,27 @@ impl PyDiskStorage {
             choice: ObjectChoice::Disk { root },
         }
     }
+
+    /// Render the configured root directory.
+    fn __repr__(&self) -> String {
+        object_repr(&self.choice)
+    }
+
+    /// Value equality: same configured root directory.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
+/// Object storage on S3 or an S3-compatible endpoint.
+///
+/// Keyword-only args: `bucket`, `region`, `endpoint`, and `prefix` (all str). Unset
+/// values, along with the AWS credentials, are resolved from the daemon's environment.
 #[pyclass(name = "S3Storage", frozen)]
 pub(crate) struct PyS3Storage {
     choice: ObjectChoice,
@@ -283,6 +557,21 @@ impl PyS3Storage {
             },
         }
     }
+
+    /// Render the configured bucket, region, endpoint, and prefix.
+    fn __repr__(&self) -> String {
+        object_repr(&self.choice)
+    }
+
+    /// Value equality: same configured bucket, region, endpoint, and prefix.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.choice == other.choice
+    }
+
+    /// Hash consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        hash_str(&self.__repr__())
+    }
 }
 
 #[derive(FromPyObject)]
@@ -302,6 +591,18 @@ impl StorageArg<'_> {
 
 // --- Scoring ---
 
+/// Frozen, hashable scoring configuration for a namespace.
+///
+/// Keyword-only args: `base` (float base similarity threshold), `floor` (float minimum
+/// threshold, must be <= base), `entity_bonus_weight` (float >= 0), `top_k` (int > 0),
+/// `entity_filter` (bool), and `context` ('ignore' or 'tiebreak'). Each defaults to the
+/// daemon's default. Raises `ConfigError` if a threshold falls outside [0, 1], `floor`
+/// exceeds `base`, the weight is negative or non-finite, `top_k` is zero, or `context`
+/// is unknown.
+///
+/// Equality compares the float thresholds with `==`; `__hash__` deliberately excludes
+/// them and hashes only `top_k`, `entity_filter`, and `context`, so equal objects
+/// always hash equal despite float comparison subtleties.
 #[pyclass(name = "Scoring", frozen)]
 pub(crate) struct PyScoring {
     dto: ScoringDto,
@@ -332,10 +633,50 @@ impl PyScoring {
         dto.to_config()?;
         Ok(Self { dto })
     }
+
+    /// Render every configured scoring field.
+    fn __repr__(&self) -> String {
+        format!(
+            "Scoring(base={}, floor={}, entity_bonus_weight={}, top_k={}, entity_filter={}, context='{}')",
+            self.dto.base_threshold,
+            self.dto.floor_threshold,
+            self.dto.entity_bonus_weight,
+            self.dto.top_k,
+            py_bool(self.dto.entity_filter),
+            self.dto.context
+        )
+    }
+
+    /// Value equality across every field, including the float thresholds.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.dto == other.dto
+    }
+
+    /// Hash over `top_k`, `entity_filter`, and `context` only; the float thresholds are
+    /// excluded so the hash stays consistent with `__eq__`.
+    fn __hash__(&self) -> isize {
+        let mut hasher = DefaultHasher::new();
+        self.dto.top_k.hash(&mut hasher);
+        self.dto.entity_filter.hash(&mut hasher);
+        self.dto.context.hash(&mut hasher);
+        hasher.finish() as isize
+    }
 }
 
 // --- The cache itself ---
 
+/// A semantic cache scoped to one namespace, backed by a shared daemon process.
+///
+/// Construct it with keyword-only backend objects: `namespace` (str, required),
+/// `embedding`, `entities`, `vectors`, `storage`, and `scoring`. Every backend is
+/// optional and falls back to a fully-local default. Construction spawns or connects
+/// the daemon and registers the namespace, which on a cold cache triggers a BLOCKING
+/// model download from Hugging Face for the local embedding and GLiNER backends; set
+/// the `SEMISWEET_MODEL_CACHE` env var to control where the weights are cached.
+///
+/// Usable as a context manager: `with SemanticCache(namespace='ns') as cache: ...`
+/// closes the daemon connection on exit. Raises `ConfigError` for an invalid namespace
+/// or backend config and `DaemonError` for daemon or IO failures.
 #[pyclass(name = "SemanticCache")]
 pub(crate) struct PySemanticCache {
     namespace: String,
@@ -349,6 +690,14 @@ impl PySemanticCache {
             .lock()
             .map_err(|_| Error::Daemon("client connection mutex poisoned".to_owned()))?;
         stub.request(request)
+    }
+
+    fn disconnect(&self) -> Result<()> {
+        let mut stub = self
+            .stub
+            .lock()
+            .map_err(|_| Error::Daemon("client connection mutex poisoned".to_owned()))?;
+        stub.bye()
     }
 }
 
@@ -406,7 +755,9 @@ impl PySemanticCache {
         }
     }
 
-    fn get(&self, py: Python<'_>, query: &PyCacheQuery) -> PyResult<Option<Cow<'static, [u8]>>> {
+    /// Look up the cached value for `query`. Returns the stored `bytes` on a semantic
+    /// hit, or `None` on a miss. Raises `BackendError`/`DaemonError` on failure.
+    fn get(&self, py: Python<'_>, query: &PyCacheQuery) -> PyResult<Option<Vec<u8>>> {
         let request = Request::Get {
             namespace: self.namespace.clone(),
             query: query.query.clone(),
@@ -415,12 +766,14 @@ impl PySemanticCache {
         };
         let response = py.detach(|| self.round_trip(&request))?;
         match response {
-            Response::Value(value) => Ok(value.map(|buf| Cow::Owned(buf.into_vec()))),
+            Response::Value(value) => Ok(value.map(|buf| buf.into_vec())),
             Response::Error(error) => Err(error.into()),
             other => Err(Error::Daemon(format!("unexpected response to Get: {other:?}")).into()),
         }
     }
 
+    /// Store `value` (`bytes`) under `query`. Returns `True` if the daemon accepted the
+    /// write. Raises `BackendError`/`DaemonError` on failure.
     fn set(&self, py: Python<'_>, query: &PyCacheQuery, value: Vec<u8>) -> PyResult<bool> {
         let request = Request::Set {
             namespace: self.namespace.clone(),
@@ -437,6 +790,8 @@ impl PySemanticCache {
         }
     }
 
+    /// Evict the entry matching `query`. Returns `True` if an entry was removed. Raises
+    /// `BackendError`/`DaemonError` on failure.
     fn delete(&self, py: Python<'_>, query: &PyCacheQuery) -> PyResult<bool> {
         let request = Request::Del {
             namespace: self.namespace.clone(),
@@ -450,6 +805,36 @@ impl PySemanticCache {
             Response::Error(error) => Err(error.into()),
             other => Err(Error::Daemon(format!("unexpected response to Del: {other:?}")).into()),
         }
+    }
+
+    /// Render the cache's namespace.
+    fn __repr__(&self) -> String {
+        format!("SemanticCache(namespace='{}')", self.namespace)
+    }
+
+    /// Send a graceful goodbye so the daemon sheds this connection. A later operation
+    /// transparently reconnects. Raises `DaemonError` if the goodbye fails.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.disconnect())?;
+        Ok(())
+    }
+
+    /// Return self for use as a context manager.
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Close the daemon connection on exit. Returns `False` so a pending exception is
+    /// not suppressed.
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 }
 
