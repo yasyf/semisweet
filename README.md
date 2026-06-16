@@ -7,13 +7,9 @@
 
 An in-memory semantic cache backed by turbopuffer.
 
-semisweet caches by meaning. It stores a payload against a query embedding and serves it again for any semantically close query, so repeated RAG answers, LLM completions, and tool results resolve from process memory in microseconds — no recompute, no vector-store round trip. The hot index lives in process; swap in [turbopuffer](https://turbopuffer.com) when recall has to outlive a process or outgrow RAM. Payloads offload to disk or S3 instead of bloating the index, so the index carries only vectors and filter metadata. The core is Rust, exposed to Python through pyo3.
-
-A lookup is a hybrid match. semisweet embeds the query, pulls the nearest entries, and accepts the best when cosine similarity clears a threshold. Shared entities between the query and a candidate relax that threshold toward a floor and add a similarity bonus, so "france's capital?" lands on the entry you stored for "what is the capital of france".
+semisweet caches by meaning. Store a payload against a query, and any semantically close query gets it back from process memory in microseconds — no recompute, no vector-store round trip. The hot index lives in process; point it at [turbopuffer](https://turbopuffer.com) when recall has to outlive a process or outgrow RAM, and payloads offload to disk or S3 so the index stays lean. The core is Rust, exposed to Python through pyo3.
 
 ## Install
-
-semisweet builds from source with [uv](https://docs.astral.sh/uv/) and maturin:
 
 ```bash
 git clone https://github.com/yasyf/semisweet
@@ -21,25 +17,18 @@ cd semisweet
 uv venv && uvx maturin develop --uv
 ```
 
-The default build is batteries-included: a bare `SemanticCache(namespace="...")` runs fully offline on local BGE-small embeddings, YAKE keyword entities, an in-process index, and on-disk payloads — no API keys, no config. The Voyage, turbopuffer, and S3 backends compile in alongside it, and the whole thing installs as a single abi3 wheel for Python 3.9+. Opt into GLiNER span-label entities with one extra feature:
-
-```bash
-uvx maturin develop --uv --features gliner
-```
+The default build runs fully offline — local BGE embeddings, keyword entities, an in-process index, on-disk payloads — and installs as a single abi3 wheel for Python 3.9+. Voyage, turbopuffer, and S3 are built in; add GLiNER entities with `--features gliner`.
 
 ## Quickstart
 
-Build a fully in-process cache, store a value, and read it back through a differently worded query. The defaults — local BGE embeddings, keyword entities, an in-process index, on-disk payloads — need no API keys, so a bare namespace is the whole setup.
+A namespace is the whole setup: every backend defaults to the local stack, so this needs no API keys.
 
 ```python
 import semisweet
 
-# Every backend defaults, so a namespace is all you need. Pass LocalEmbedding,
-# KeywordEntities, MemoryVectors, or DiskStorage to override an axis.
 cache = semisweet.SemanticCache(namespace="research-cache")
 
-# `set` is read-after-write: a `get` for the same query returns the value at once,
-# while the durable write drains in the background.
+# `set` is read-after-write: a `get` for the same query returns the value at once.
 cache.set(semisweet.CacheQuery(query="what is the capital of france"), b"paris")
 
 # A reworded query still hits the stored entry.
@@ -51,20 +40,20 @@ print(hit)
 b'paris'
 ```
 
-`CacheQuery(query=..., keys=..., context=...)` is keyword-only: `query` is the text to match on, `keys` an optional set of exact-match filter tags, `context` optional fallback text. `keys` is a contains-all filter — an entry matches only when it carries every key in the query — and `context` feeds entity extraction and breaks lexical ties when the query alone is thin. `get` returns the stored `bytes` on a hit or `None` on a miss; `delete` drops the entry and returns whether it existed.
+`CacheQuery(query=..., keys=..., context=...)` is keyword-only. `keys` is an optional contains-all filter; `context` is optional fallback text for entity extraction and tie-breaking. `get` returns `bytes` or `None`, and `delete` returns whether the entry existed.
 
 ## Backends
 
-semisweet has four pluggable backend axes, each set once by passing a backend object to `SemanticCache`. Eight builtins ship across them, every constructor keyword-only with all-optional arguments:
+Swap any axis by passing a backend object — all keyword-only, every argument optional:
 
 | Axis | Builtins |
 |------|----------|
 | Embedding | `LocalEmbedding(model=...)` — BGE-small on CPU; `VoyageEmbedding(model=..., dim=...)` — Voyage HTTP API |
-| Entities | `KeywordEntities(lang=...)` — YAKE keywords; `GlinerEntities(labels=..., repo=...)` — GLiNER span labels (`--features gliner`) |
+| Entities | `KeywordEntities(lang=...)` — YAKE keywords; `GlinerEntities(labels=..., repo=...)` — GLiNER spans (`--features gliner`) |
 | Vector index | `MemoryVectors()` — in-process; `TurbopufferVectors()` — turbopuffer |
 | Object store | `DiskStorage(root=...)` — local filesystem; `S3Storage(bucket=..., region=..., endpoint=..., prefix=...)` — S3-compatible |
 
-Payloads always live in the object store, so offload is first-class. `LocalEmbedding` ships in the default build; `GlinerEntities` compiles behind the `gliner` cargo feature. Both download their model from the Hugging Face Hub on first use and run offline after — the same auto-download as fastembed's BGE, cached under `SEMISWEET_MODEL_CACHE`. Point `GlinerEntities` at a different model through its `repo` / `model` / `tokenizer` keywords. Each remote backend reads its credentials from the environment as you select it:
+Local models (BGE, and GLiNER under `--features gliner`) auto-download from the Hugging Face Hub on first use, cached under `SEMISWEET_MODEL_CACHE`. Remote backends read credentials from the environment:
 
 | Variable | Read by |
 |----------|---------|
@@ -72,20 +61,16 @@ Payloads always live in the object store, so offload is first-class. `LocalEmbed
 | `TURBOPUFFER_API_KEY` | `TurbopufferVectors` |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_ENDPOINT`, `SEMISWEET_S3_BUCKET` | `S3Storage` |
 
-## Architecture
-
-Models and the in-memory index cost real time to load, so semisweet keeps them out of your Python process. The first cache you build lazily spawns a single per-user daemon: an orphan process that holds the loaded models and the in-memory index and serves every cache across every Python process you run. It outlives the process that spawned it and idle-shuts-down once no client has talked to it for a timeout, so a burst of scripts shares one warm copy of the models instead of paying the load cost each time.
+The first cache spawns a shared per-user daemon that holds the models and index, so only the first call pays the load cost.
 
 ## Development
-
-Rust unit tests live beside the code in `src/`; Python binding tests live in `tests/`:
 
 ```bash
 cargo test
 uv venv && uvx maturin develop --uv && uv pip install pytest && pytest
 ```
 
-See [AGENTS.md](AGENTS.md) for the full conventions.
+See [AGENTS.md](AGENTS.md) for conventions.
 
 ## License
 
