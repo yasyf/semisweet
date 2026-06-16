@@ -17,6 +17,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 
+# Compiled extension built in-place into the package source by `maturin develop`/`build`
+# (mixed layout: module-name = "semisweet.core", python-source = "python").
+/python/semisweet/*.so
+/python/semisweet/*.pyd
+
 # Rust
 /target
 # Cargo.lock is intentionally committed (this crate ships a wheel; reproducible

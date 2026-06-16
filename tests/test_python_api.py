@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from semisweet import (
+from semisweet.core import (
     CacheQuery,
     DiskStorage,
     GlinerEntities,
@@ -68,12 +68,12 @@ def test_backend_constructs_with_every_kwarg_optional(backend):
 
 def test_run_daemon_is_internal_but_importable_from_submodule():
     # The launcher spawns the daemon in a fresh process via
-    # `from semisweet.semisweet import _run_daemon; _run_daemon()`. That entry point stays
-    # out of the public `__all__` (so `from semisweet import *` and the stub agree), but it
-    # must remain importable from the extension submodule the spawn command targets. This
-    # pins the submodule coupling so a packaging-layout change fails here, not at spawn time.
+    # `from semisweet.core import _run_daemon; _run_daemon()`. That entry point stays out of
+    # the package's public `__all__`, but it must remain importable from the extension
+    # submodule the spawn command targets. This pins the submodule coupling so a
+    # packaging-layout change fails here, not at spawn time.
     import semisweet
-    from semisweet.semisweet import _run_daemon
+    from semisweet.core import _run_daemon
 
     assert "_run_daemon" not in semisweet.__all__
     assert callable(_run_daemon)

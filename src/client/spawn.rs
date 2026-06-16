@@ -13,12 +13,12 @@ use crate::protocol::PROTOCOL_VERSION;
 const ENV_IDLE_SECS: &str = "SEMISWEET_IDLE_SECS";
 const ENV_MODEL_CACHE: &str = "SEMISWEET_MODEL_CACHE";
 
-// Maturin ships the extension as the `semisweet.semisweet` submodule under a package
-// wrapper (the root `semisweet.pyi` forces the package layout). Import the daemon entry
-// point straight from that submodule: the wrapper's `from .semisweet import *` re-exports
-// only names in `__all__`, and `_run_daemon` is deliberately kept out of the public
-// `__all__`, so `semisweet._run_daemon` at package level does not exist.
-const DAEMON_BOOTSTRAP: &str = "from semisweet.semisweet import _run_daemon; _run_daemon()";
+// The compiled extension is the `semisweet.core` submodule (maturin mixed layout:
+// `python/semisweet/` is the package, `module-name = "semisweet.core"`). Import the daemon
+// entry point straight from that submodule: `_run_daemon` is deliberately kept out of the
+// package's public `__all__`, so `semisweet._run_daemon` does not exist; the submodule path
+// is the stable handle the launcher targets.
+const DAEMON_BOOTSTRAP: &str = "from semisweet.core import _run_daemon; _run_daemon()";
 
 // Credential and model-location variables the daemon's backends read at
 // construction. The daemon runs detached with `cwd = /`, so the spawning client

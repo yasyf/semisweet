@@ -1,9 +1,10 @@
-"""Type stubs for the ``semisweet`` extension module.
+"""Type stubs for the compiled ``semisweet.core`` extension module.
 
-``semisweet`` is an async, in-memory semantic cache with pluggable backends. The
-public surface is declarative and keyword-only: build a cache out of backend config
-objects and look it up with frozen, hashable :class:`CacheQuery` values. Every
-backend argument is optional and falls back to a fully-local default.
+``semisweet.core`` is the raw, bytes-valued layer of semisweet: an async, in-memory
+semantic cache with pluggable backends. The public surface is declarative and
+keyword-only: build a cache out of backend config objects and look it up with frozen,
+hashable :class:`CacheQuery` values. The pure-Python ``semisweet`` package re-exports
+these names and layers an async object cache + ``@cache`` decorator on top.
 """
 
 from collections.abc import Sequence
@@ -134,7 +135,7 @@ class Scoring:
     def __hash__(self) -> int: ...
 
 class SemanticCache:
-    """A semantic cache scoped to one namespace, backed by a shared daemon process."""
+    """A raw, bytes-valued semantic cache scoped to one namespace, backed by a shared daemon."""
 
     def __init__(
         self,

@@ -25,12 +25,13 @@ A namespace is the whole setup: every backend defaults to the local stack, so th
 
 ```python
 import asyncio
+
 import semisweet
 
 async def main():
     cache = semisweet.SemanticCache(namespace="research-cache")  # sync config, no I/O
-    # `set` is read-after-write: a `get` for the same query returns the value at once.
-    await cache.set(semisweet.CacheQuery(query="what is the capital of france"), b"paris")
+    # Store any Python object; `set` is read-after-write.
+    await cache.set(semisweet.CacheQuery(query="what is the capital of france"), {"answer": "paris"})
     # A reworded query still hits the stored entry.
     hit = await cache.get(semisweet.CacheQuery(query="france's capital?"))
     print(hit)
@@ -39,10 +40,28 @@ asyncio.run(main())
 ```
 
 ```
-b'paris'
+{'answer': 'paris'}
 ```
 
-`CacheQuery(query=..., keys=..., context=...)` is keyword-only. `keys` is an optional contains-all filter; `context` is optional fallback text for entity extraction and tie-breaking. Constructing the cache is synchronous and does no I/O; the first `await` transparently spawns and connects a shared per-user daemon. `get`, `set`, and `delete` are awaitable: `get` returns `bytes` or `None`, and `delete` returns whether the entry existed.
+`SemanticCache` stores and returns whole Python objects. A [Pydantic](https://docs.pydantic.dev) model round-trips to its exact class when the `pydantic` extra is installed; anything else falls back to `pickle`. `get` returns the stored object, or the `MISS` sentinel on a miss — so `None` is a value you can cache. The raw, bytes-in bytes-out cache lives at `semisweet.core.SemanticCache` when you want to own serialization yourself.
+
+`CacheQuery(query=..., keys=..., context=...)` is keyword-only. `keys` is an optional contains-all filter; `context` is optional fallback text for entity extraction and tie-breaking. Constructing the cache is synchronous and does no I/O; the first `await` transparently spawns and connects a shared per-user daemon. `get`, `set`, and `delete` are all awaitable.
+
+### Memoize a function
+
+`@semisweet.cache` turns an `async def` into a semantic cache keyed on the function, with its `module:qualname` as the namespace; a hit skips the body. The sole string argument becomes the query — name it with `query=` when there's more than one.
+
+```python
+@semisweet.cache(query="question")
+async def answer(question: str) -> dict[str, str]:
+    return {"answer": "paris"}  # stand-in for an expensive model call
+
+async def main():
+    await answer("what is the capital of france")  # runs the body, caches the result
+    await answer("france's capital?")              # semantically close -> served from cache
+```
+
+Scope entries with exact-match discriminators via `keys=("model",)`, and steer tie-breaking with `context="..."`, naming the parameters to read them from.
 
 You rarely manage the daemon by hand — it idle-shuts-down on its own. When you do, `await semisweet.shutdown_daemon()` stops the shared daemon and returns whether one was running.
 
@@ -71,7 +90,7 @@ The first `await` spawns a shared per-user daemon that holds the models and inde
 
 ```bash
 cargo test
-uv venv && uvx maturin develop --uv && uv pip install pytest pytest-asyncio && pytest
+uv venv && uvx maturin develop --uv && uv pip install --group test && pytest
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions.

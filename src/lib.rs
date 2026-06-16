@@ -187,9 +187,10 @@ fn install_async_facade(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// The `semisweet` Python extension module.
+/// The compiled `semisweet.core` extension module. The pure-Python `semisweet` package
+/// re-exports these symbols and layers the async object cache + `@cache` decorator on top.
 #[pymodule]
-fn semisweet(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::PyCacheQuery>()?;
     m.add_class::<python::PyLocalEmbedding>()?;
     m.add_class::<python::PyVoyageEmbedding>()?;

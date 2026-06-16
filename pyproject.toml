@@ -25,29 +25,33 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 
+[project.optional-dependencies]
+# Pydantic is optional: the async object cache serializes BaseModel values as a portable,
+# type-tagged JSON envelope when pydantic is importable, and falls back to pickle otherwise.
+# The published wheel carries no required runtime dependencies.
+pydantic = ["pydantic>=2"]
+
 [project.urls]
 Homepage = "https://github.com/yasyf/semisweet"
 Repository = "https://github.com/yasyf/semisweet"
 Issues = "https://github.com/yasyf/semisweet/issues"
 
 [tool.maturin]
-# Import module == crate name == "semisweet" (pure-Rust, single top-level module).
-module-name = "semisweet"
+# Mixed Rust/Python layout: the pure-Python package lives in `python/semisweet/`, and the
+# compiled extension ships as the `semisweet.core` submodule (`#[pymodule] fn core` emits
+# `PyInit_core`). The package's hand-written `__init__.py` re-exports the raw API and layers
+# the async object cache + `@cache` decorator on top.
+module-name = "semisweet.core"
+python-source = "python"
 manifest-path = "Cargo.toml"
-# No `features` key: extension-module is deprecated/auto-handled, and the abi3-py39
-# floor is already a default feature in Cargo.toml (single source of truth).
-# No `python-source`: pure-Rust layout has no Python package directory.
-# No `include` key for type stubs: for a pure-Rust project maturin auto-ships the
-# project-root `semisweet.pyi` plus the `py.typed` marker into the wheel root next
-# to `semisweet.abi3.so` (PyO3 typing-hints guide / maturin project layout). PEP 561
-# does not formally cover single-module distributions, but this root `.pyi` + root
-# `py.typed` pair is the established convention type checkers honor for pyo3 modules.
+# No `features` key: extension-module is deprecated/auto-handled, and the abi3-py39 floor is
+# already a default feature in Cargo.toml (single source of truth). The `python/semisweet/`
+# tree ships its own `py.typed` marker and `core.pyi` (the extension's stub).
 
-# Test-only dependencies (PEP 735). `uv pip install --group test` pulls pytest into the
-# venv after `maturin develop`; without this the `pytest` invocation is `command not
-# found`. Kept out of [project] so the published wheel carries no test deps.
+# Test-only dependencies (PEP 735). `uv pip install --group test` pulls them into the venv
+# after `maturin develop`; kept out of [project] so the published wheel carries no test deps.
 [dependency-groups]
-test = ["pytest>=8", "pytest-asyncio>=0.24"]
+test = ["pytest>=8", "pytest-asyncio>=0.24", "pydantic>=2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

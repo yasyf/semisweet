@@ -1,28 +1,30 @@
-"""Drift guard between ``semisweet.pyi`` and the compiled module.
+"""Drift guard between ``python/semisweet/core.pyi`` and the compiled ``semisweet.core``.
 
 pyo3 abi3 classes expose little introspection, so this checks names, not deep
-signatures: every class/function declared in the stub must exist at runtime, and
-every public runtime name must be declared in the stub. A new export on either
-side fails the build until the stub catches up.
+signatures: every class/function declared in the stub must exist on the extension at
+runtime, and every public runtime name must be declared in the stub. A new export on
+either side fails the build until the stub catches up.
 """
 
 import ast
 from pathlib import Path
 
-import semisweet
+import semisweet.core as core
 
 
 def _stub_path() -> Path:
-    # Source of truth at the repo root; fall back to the copy maturin ships next to
-    # the compiled module in site-packages.
-    repo_root = Path(__file__).resolve().parent.parent / "semisweet.pyi"
+    # Source of truth in the package source tree; fall back to the copy maturin ships
+    # next to the compiled extension in site-packages.
+    repo_root = (
+        Path(__file__).resolve().parent.parent / "python" / "semisweet" / "core.pyi"
+    )
     if repo_root.is_file():
         return repo_root
-    installed = Path(semisweet.__file__).resolve().parent / "semisweet.pyi"
+    installed = Path(core.__file__).resolve().parent / "core.pyi"
     if installed.is_file():
         return installed
     raise FileNotFoundError(
-        "semisweet.pyi not found at the repo root or alongside the installed module"
+        "core.pyi not found in python/semisweet/ or alongside the installed extension"
     )
 
 
@@ -36,14 +38,14 @@ def _declared_names() -> set[str]:
 
 
 def _public_runtime_names() -> set[str]:
-    exported = getattr(semisweet, "__all__", None)
+    exported = getattr(core, "__all__", None)
     if exported is not None:
         return set(exported)
-    return {name for name in dir(semisweet) if not name.startswith("_")}
+    return {name for name in dir(core) if not name.startswith("_")}
 
 
 def test_every_stub_name_exists_at_runtime():
-    missing = {name for name in _declared_names() if not hasattr(semisweet, name)}
+    missing = {name for name in _declared_names() if not hasattr(core, name)}
     assert missing == set(), f"declared in stub but absent at runtime: {sorted(missing)}"
 
 

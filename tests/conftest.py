@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from semisweet import (
+from semisweet.core import (
     DiskStorage,
     KeywordEntities,
     LocalEmbedding,
@@ -101,3 +101,46 @@ def make_cache(runtime: Path) -> CacheFactory:
         return SemanticCache(**params)
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _clear_decorator_caches() -> Iterator[None]:
+    # The @cache registry is module-global; keep it empty around every test so a cache
+    # bound to a previous test's daemon/namespace is never reused.
+    import semisweet.decorator as decorator
+
+    decorator._caches.clear()
+    yield
+    decorator._caches.clear()
+
+
+@pytest.fixture
+def mock_raw_cache(monkeypatch: pytest.MonkeyPatch) -> type:
+    """Replace the raw ``core.SemanticCache`` with an in-memory fake: no daemon, no model.
+
+    The object layer's serde and the real, hashable ``CacheQuery`` stay exercised; only the
+    daemon round-trip is faked, keyed by the query value.
+    """
+
+    class FakeRaw:
+        instances: list["FakeRaw"] = []
+
+        def __init__(self, *, namespace: str, **_: object) -> None:
+            self.namespace = namespace
+            self.store: dict[object, bytes] = {}
+            self.last_query: object = None
+            FakeRaw.instances.append(self)
+
+        async def get(self, query: object) -> bytes | None:
+            return self.store.get(query)
+
+        async def set(self, query: object, value: bytes) -> bool:
+            self.last_query = query
+            self.store[query] = value
+            return True
+
+        async def delete(self, query: object) -> bool:
+            return self.store.pop(query, None) is not None
+
+    monkeypatch.setattr("semisweet.objectcache._RawSemanticCache", FakeRaw)
+    return FakeRaw
