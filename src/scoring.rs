@@ -103,7 +103,7 @@ impl ScoringConfig {
                         oa.cmp(&ob).then(a.score.total_cmp(&b.score))
                     })
             }
-            _ => accepted
+            (ContextMode::Ignore, _) | (ContextMode::Tiebreak, None) => accepted
                 .into_iter()
                 .max_by(|a, b| a.score.total_cmp(&b.score)),
         }
