@@ -451,10 +451,7 @@ mod tests {
             base_threshold: f32::NAN,
             ..ScoringDto::default()
         };
-        assert!(matches!(
-            nan_base.to_config(),
-            Err(Error::InvalidConfig(_))
-        ));
+        assert!(matches!(nan_base.to_config(), Err(Error::InvalidConfig(_))));
 
         let nan_floor = ScoringDto {
             floor_threshold: f32::NAN,

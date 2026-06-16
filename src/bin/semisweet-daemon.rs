@@ -27,7 +27,8 @@ fn main() -> ExitCode {
 
 fn spawn_only() -> Result<(), Error> {
     let exe = std::env::current_exe()?;
-    let _stub = connect_or_spawn(&Launcher::Exe(exe))?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let _stub = runtime.block_on(connect_or_spawn(&Launcher::Exe(exe)))?;
     println!("READY");
     std::io::stdout().flush()?;
     loop {

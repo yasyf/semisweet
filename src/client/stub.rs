@@ -1,43 +1,42 @@
-//! A persistent blocking client connection to the daemon, with lazy spawn and a
+//! A persistent async client connection to the daemon, with lazy spawn and a
 //! single transparent reconnect.
 
 use std::io::ErrorKind;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::UnixStream;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use super::spawn::{Launcher, spawn_daemon};
 use crate::error::{Error, Result};
 use crate::paths;
-use crate::protocol::{self, ClientId, PROTOCOL_VERSION, ProtocolError, Request, Response};
+use crate::protocol::{
+    self, ClientId, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Request, Response,
+};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+type Conn = Framed<UnixStream, LengthDelimitedCodec>;
+
 pub struct ClientStub {
-    stream: UnixStream,
+    framed: Conn,
     client: ClientId,
     launcher: Launcher,
 }
 
-pub fn connect_or_spawn(launcher: &Launcher) -> Result<ClientStub> {
-    let stream = connect_with_spawn(launcher)?;
-    let mut stub = ClientStub {
-        stream,
-        client: ClientId::generate(),
+pub async fn connect_or_spawn(launcher: &Launcher) -> Result<ClientStub> {
+    let client = ClientId::generate();
+    let framed = spawn_connect(launcher.clone(), client).await?;
+    Ok(ClientStub {
+        framed,
+        client,
         launcher: launcher.clone(),
-    };
-    // Retry the handshake once on a transient connection drop: a client racing the
-    // daemon's idle shutdown can connect to a socket whose listener is already gone,
-    // so the first `hello` reads EOF. Reconnecting respawns the daemon transparently.
-    match stub.hello() {
-        Ok(()) => Ok(stub),
-        Err(error) if is_transient_drop(&error) => {
-            stub.reconnect()?;
-            Ok(stub)
-        }
-        Err(other) => Err(other),
-    }
+    })
 }
 
 fn dead_socket(error: &std::io::Error) -> bool {
@@ -77,15 +76,15 @@ fn is_transient_drop(error: &Error) -> bool {
     }
 }
 
-fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
-    match UnixStream::connect(socket) {
+fn try_connect(socket: &Path) -> Result<Option<StdUnixStream>> {
+    match StdUnixStream::connect(socket) {
         Ok(stream) => Ok(Some(stream)),
         Err(error) if dead_socket(&error) => Ok(None),
         Err(error) => Err(Error::Io(error)),
     }
 }
 
-fn connect_with_spawn(launcher: &Launcher) -> Result<UnixStream> {
+fn connect_with_spawn(launcher: &Launcher) -> Result<StdUnixStream> {
     let socket = paths::socket_path()?;
 
     if let Some(stream) = try_connect(&socket)? {
@@ -124,60 +123,107 @@ fn connect_with_spawn(launcher: &Launcher) -> Result<UnixStream> {
     }
 }
 
+fn hello(stream: &mut StdUnixStream, client: ClientId) -> Result<()> {
+    let request = Request::Hello {
+        client,
+        protocol: PROTOCOL_VERSION,
+        pid: std::process::id(),
+    };
+    protocol::write_frame(stream, &request)?;
+    match protocol::read_frame(stream)? {
+        Response::Welcome { protocol, .. } if protocol == PROTOCOL_VERSION => Ok(()),
+        Response::Error(ProtocolError::VersionMismatch { client, daemon }) => {
+            Err(Error::ProtocolVersionMismatch { client, daemon })
+        }
+        other => Err(Error::Daemon(format!(
+            "unexpected handshake response: {other:?}"
+        ))),
+    }
+}
+
+// The fork/lock/poll spawn and the blocking handshake stay synchronous: they run
+// inside `spawn_blocking` so the fork+exec and the spawn-poll never touch the async
+// reactor. Retry the handshake once on a transient connection drop — a client racing
+// the daemon's idle shutdown can connect to a socket whose listener is already gone,
+// so the first `hello` reads EOF and a reconnect respawns the daemon transparently.
+fn connect_and_handshake(launcher: &Launcher, client: ClientId) -> Result<StdUnixStream> {
+    let mut stream = connect_with_spawn(launcher)?;
+    match hello(&mut stream, client) {
+        Ok(()) => Ok(stream),
+        Err(error) if is_transient_drop(&error) => {
+            let mut retry = connect_with_spawn(launcher)?;
+            hello(&mut retry, client)?;
+            Ok(retry)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn into_framed(stream: StdUnixStream) -> Result<Conn> {
+    stream.set_nonblocking(true)?;
+    let stream = UnixStream::from_std(stream)?;
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME_BYTES)
+        .new_codec();
+    Ok(Framed::new(stream, codec))
+}
+
+async fn spawn_connect(launcher: Launcher, client: ClientId) -> Result<Conn> {
+    let stream = tokio::task::spawn_blocking(move || connect_and_handshake(&launcher, client))
+        .await
+        .map_err(|error| Error::Daemon(format!("connect task failed: {error}")))??;
+    into_framed(stream)
+}
+
 impl ClientStub {
     pub fn client_id(&self) -> ClientId {
         self.client
     }
 
-    fn hello(&mut self) -> Result<()> {
-        let request = Request::Hello {
-            client: self.client,
-            protocol: PROTOCOL_VERSION,
-            pid: std::process::id(),
-        };
-        protocol::write_frame(&mut self.stream, &request)?;
-        match protocol::read_frame(&mut self.stream)? {
-            Response::Welcome { protocol, .. } if protocol == PROTOCOL_VERSION => Ok(()),
-            Response::Error(ProtocolError::VersionMismatch { client, daemon }) => {
-                Err(Error::ProtocolVersionMismatch { client, daemon })
-            }
-            other => Err(Error::Daemon(format!(
-                "unexpected handshake response: {other:?}"
-            ))),
+    async fn send_frame(&mut self, request: &Request) -> Result<()> {
+        let body = protocol::encode(request)?;
+        self.framed.send(Bytes::from(body)).await?;
+        Ok(())
+    }
+
+    async fn recv_frame(&mut self) -> Result<Response> {
+        match self.framed.next().await {
+            Some(frame) => protocol::decode(&frame?),
+            None => Err(Error::Io(std::io::Error::from(ErrorKind::UnexpectedEof))),
         }
     }
 
-    fn round_trip(&mut self, request: &Request) -> Result<Response> {
-        protocol::write_frame(&mut self.stream, request)?;
-        protocol::read_frame(&mut self.stream)
+    async fn round_trip(&mut self, request: &Request) -> Result<Response> {
+        self.send_frame(request).await?;
+        self.recv_frame().await
     }
 
-    fn reconnect(&mut self) -> Result<()> {
-        self.stream = connect_with_spawn(&self.launcher)?;
-        self.hello()
+    async fn reconnect(&mut self) -> Result<()> {
+        self.framed = spawn_connect(self.launcher.clone(), self.client).await?;
+        Ok(())
     }
 
-    pub fn request(&mut self, request: &Request) -> Result<Response> {
-        match self.round_trip(request) {
+    pub async fn request(&mut self, request: &Request) -> Result<Response> {
+        match self.round_trip(request).await {
             Ok(response) => Ok(response),
             Err(error) if is_transient_drop(&error) => {
-                self.reconnect()?;
-                self.round_trip(request)
+                self.reconnect().await?;
+                self.round_trip(request).await
             }
             Err(other) => Err(other),
         }
     }
 
-    pub fn ping(&mut self) -> Result<()> {
-        match self.request(&Request::Ping)? {
+    pub async fn ping(&mut self) -> Result<()> {
+        match self.request(&Request::Ping).await? {
             Response::Pong => Ok(()),
             other => Err(Error::Daemon(format!("expected Pong, got {other:?}"))),
         }
     }
 
-    pub fn bye(&mut self) -> Result<()> {
-        protocol::write_frame(&mut self.stream, &Request::Bye)?;
-        match protocol::read_frame(&mut self.stream)? {
+    pub async fn bye(&mut self) -> Result<()> {
+        self.send_frame(&Request::Bye).await?;
+        match self.recv_frame().await? {
             Response::Goodbye => Ok(()),
             other => Err(Error::Daemon(format!("expected Goodbye, got {other:?}"))),
         }

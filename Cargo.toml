@@ -3,7 +3,7 @@ name = "semisweet"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-description = "An in-memory semantic cache backed by turbopuffer."
+description = "An async, in-memory semantic cache with pluggable backends."
 authors = ["Yasyf Mohamedali <yasyfm@gmail.com>"]
 license = "PolyForm-Noncommercial-1.0.0"
 readme = "README.md"
@@ -28,6 +28,7 @@ path = "src/bin/semisweet-daemon.rs"
 # the single source of truth for cargo and maturin alike, mirrored by
 # requires-python ">=3.9" in pyproject.toml.
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v5", "v4"] }
 
@@ -47,7 +48,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 bytes = "1"
 # MPMC channels for the daemon's dedicated blocking pools (inference + write-behind).
 crossbeam-channel = "0.5"
-nix = { version = "0.31", features = ["process", "user"] }
+nix = { version = "0.31", features = ["process", "user", "signal"] }
 fd-lock = "4"
 directories = "6"
 
@@ -90,6 +91,9 @@ tempfile = "3.27.0"
 # Set request the daemon's public protocol carries.
 serde_json = "1.0.150"
 serde_bytes = "0.11"
+# The lifecycle/serving/load integration tests drive the now-async ClientStub, so they
+# need the `#[tokio::test]` macro and a multi-thread runtime for the concurrent clients.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Real MinIO container for the object_s3 integration test; the `blocking` feature
 # exposes a sync container runner to match the sync s3 client.
 testcontainers = "0.27.3"

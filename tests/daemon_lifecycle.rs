@@ -132,8 +132,8 @@ fn spawn_killable_spawner(env: &TestEnv) -> Child {
         .unwrap()
 }
 
-#[test]
-fn orphan_survives_spawner_death() {
+#[tokio::test]
+async fn orphan_survives_spawner_death() {
     let env = TestEnv::new(60);
 
     let mut spawner = spawn_killable_spawner(&env);
@@ -146,8 +146,8 @@ fn orphan_survives_spawner_death() {
     kill9(spawner.id());
     let _ = spawner.wait();
 
-    let mut stub = connect_or_spawn(&env.launcher()).unwrap();
-    stub.ping().unwrap();
+    let mut stub = connect_or_spawn(&env.launcher()).await.unwrap();
+    stub.ping().await.unwrap();
 
     assert_eq!(
         ppid_of(daemon_pid),
@@ -161,15 +161,15 @@ fn orphan_survives_spawner_death() {
     );
 }
 
-#[test]
-fn idle_shutdown_after_timeout() {
+#[tokio::test]
+async fn idle_shutdown_after_timeout() {
     let env = TestEnv::new(1);
 
-    let mut stub = connect_or_spawn(&env.launcher()).unwrap();
+    let mut stub = connect_or_spawn(&env.launcher()).await.unwrap();
     let daemon_pid = env.daemon_pid();
     assert!(pid_alive(daemon_pid));
 
-    stub.bye().unwrap();
+    stub.bye().await.unwrap();
     drop(stub);
 
     let shut_down = wait_until(Duration::from_secs(6), || {
@@ -181,14 +181,14 @@ fn idle_shutdown_after_timeout() {
     );
 }
 
-#[test]
-fn two_clients_share_one_daemon() {
+#[tokio::test]
+async fn two_clients_share_one_daemon() {
     let env = TestEnv::new(60);
 
-    let mut a = connect_or_spawn(&env.launcher()).unwrap();
+    let mut a = connect_or_spawn(&env.launcher()).await.unwrap();
     let first_pid = env.daemon_pid();
 
-    let mut b = connect_or_spawn(&env.launcher()).unwrap();
+    let mut b = connect_or_spawn(&env.launcher()).await.unwrap();
     let second_pid = env.daemon_pid();
 
     assert_eq!(
@@ -197,17 +197,17 @@ fn two_clients_share_one_daemon() {
     );
     assert!(pid_alive(first_pid));
 
-    a.ping().unwrap();
-    b.ping().unwrap();
+    a.ping().await.unwrap();
+    b.ping().await.unwrap();
 }
 
-#[test]
-fn stale_socket_recovery() {
+#[tokio::test]
+async fn stale_socket_recovery() {
     let env = TestEnv::new(60);
 
-    let mut stub = connect_or_spawn(&env.launcher()).unwrap();
+    let mut stub = connect_or_spawn(&env.launcher()).await.unwrap();
     let old_pid = env.daemon_pid();
-    stub.ping().unwrap();
+    stub.ping().await.unwrap();
     drop(stub);
 
     // kill -9 leaves the socket file behind with no listener.
@@ -218,11 +218,11 @@ fn stale_socket_recovery() {
         "a kill -9'd daemon should leave a stale socket file"
     );
 
-    let mut fresh = connect_or_spawn(&env.launcher()).unwrap();
+    let mut fresh = connect_or_spawn(&env.launcher()).await.unwrap();
     let new_pid = env.daemon_pid();
     assert_ne!(
         old_pid, new_pid,
         "connect_or_spawn should clean the stale socket and start a new daemon"
     );
-    fresh.ping().unwrap();
+    fresh.ping().await.unwrap();
 }

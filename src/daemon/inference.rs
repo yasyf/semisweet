@@ -26,8 +26,7 @@ impl InferencePool {
                     // A panicking job drops its oneshot `tx`, so the awaiting handler
                     // already unblocks with `Err(DaemonShutdown)`; catching here keeps the
                     // worker thread alive so one bad job can't permanently kill it.
-                    if let Err(panic) =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                     {
                         eprintln!("semisweet-daemon: inference job panicked: {panic:?}");
                         continue;

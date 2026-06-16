@@ -1,13 +1,12 @@
 """Type stubs for the ``semisweet`` extension module.
 
-``semisweet`` is an in-memory semantic cache backed by turbopuffer. The public
-surface is declarative and keyword-only: build a cache out of backend config
+``semisweet`` is an async, in-memory semantic cache with pluggable backends. The
+public surface is declarative and keyword-only: build a cache out of backend config
 objects and look it up with frozen, hashable :class:`CacheQuery` values. Every
 backend argument is optional and falls back to a fully-local default.
 """
 
 from collections.abc import Sequence
-from types import TracebackType
 
 __all__ = [
     "CacheQuery",
@@ -21,6 +20,7 @@ __all__ = [
     "DiskStorage",
     "S3Storage",
     "Scoring",
+    "shutdown_daemon",
     "SemisweetError",
     "ConfigError",
     "NamespaceError",
@@ -146,26 +146,16 @@ class SemanticCache:
         storage: DiskStorage | S3Storage | None = None,
         scoring: Scoring | None = None,
     ) -> None: ...
-    def get(self, query: CacheQuery) -> bytes | None:
+    async def get(self, query: CacheQuery) -> bytes | None:
         """Return the cached value for ``query``, or ``None`` on a miss."""
         ...
-    def set(self, query: CacheQuery, value: bytes) -> bool:
+    async def set(self, query: CacheQuery, value: bytes) -> bool:
         """Store ``value`` under ``query``; return ``True`` if the daemon accepted it."""
         ...
-    def delete(self, query: CacheQuery) -> bool:
+    async def delete(self, query: CacheQuery) -> bool:
         """Evict the entry matching ``query``; return ``True`` if one was removed."""
         ...
-    def close(self) -> None:
-        """Send a graceful goodbye so the daemon sheds this connection."""
-        ...
     def __repr__(self) -> str: ...
-    def __enter__(self) -> "SemanticCache": ...
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool: ...
 
 class SemisweetError(Exception):
     """Base class for every error raised by semisweet."""
@@ -182,6 +172,6 @@ class BackendError(SemisweetError, RuntimeError):
 class DaemonError(SemisweetError, RuntimeError):
     """The daemon connection, lifecycle, or IO failed; also a ``RuntimeError``."""
 
-def _run_daemon() -> None:
-    """Run the daemon serving loop (internal entry point)."""
+async def shutdown_daemon() -> bool:
+    """Signal the shared daemon to shut down; return ``True`` if one was running."""
     ...

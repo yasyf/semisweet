@@ -66,69 +66,82 @@ def test_backend_constructs_with_every_kwarg_optional(backend):
     backend()
 
 
+def test_run_daemon_is_internal_but_importable_from_submodule():
+    # The launcher spawns the daemon in a fresh process via
+    # `from semisweet.semisweet import _run_daemon; _run_daemon()`. That entry point stays
+    # out of the public `__all__` (so `from semisweet import *` and the stub agree), but it
+    # must remain importable from the extension submodule the spawn command targets. This
+    # pins the submodule coupling so a packaging-layout change fails here, not at spawn time.
+    import semisweet
+    from semisweet.semisweet import _run_daemon
+
+    assert "_run_daemon" not in semisweet.__all__
+    assert callable(_run_daemon)
+
+
 # --- roundtrip (needs the BGE model) ---
 
 
 @pytest.mark.needs_model
-def test_set_then_get_is_read_after_write(make_cache):
+async def test_set_then_get_is_read_after_write(make_cache):
     cache = make_cache("roundtrip")
     query = CacheQuery(query="what is the capital of france")
 
-    assert cache.set(query, b"paris") is True
+    assert await cache.set(query, b"paris") is True
     # No polling: the value is served from the in-memory pending shadow immediately.
-    assert cache.get(query) == b"paris"
+    assert await cache.get(query) == b"paris"
 
 
 @pytest.mark.needs_model
-def test_unrelated_query_misses(make_cache):
+async def test_unrelated_query_misses(make_cache):
     cache = make_cache("miss")
     stored = CacheQuery(query="what is the capital of france")
 
-    assert cache.set(stored, b"paris") is True
-    assert cache.get(stored) == b"paris"
-    assert cache.get(CacheQuery(query="how do tides work")) is None
+    assert await cache.set(stored, b"paris") is True
+    assert await cache.get(stored) == b"paris"
+    assert await cache.get(CacheQuery(query="how do tides work")) is None
 
 
 @pytest.mark.needs_model
-def test_delete_removes_entry(make_cache):
+async def test_delete_removes_entry(make_cache):
     cache = make_cache("delete")
     query = CacheQuery(query="what is the capital of france")
 
-    assert cache.set(query, b"paris") is True
-    assert cache.get(query) == b"paris"
+    assert await cache.set(query, b"paris") is True
+    assert await cache.get(query) == b"paris"
 
-    assert cache.delete(query) is True
-    assert cache.get(query) is None
+    assert await cache.delete(query) is True
+    assert await cache.get(query) is None
 
 
 @pytest.mark.needs_model
-def test_large_payload_roundtrips_exact_bytes(make_cache):
+async def test_large_payload_roundtrips_exact_bytes(make_cache):
     cache = make_cache("largepayload")
     query = CacheQuery(query="summarize the quarterly earnings report")
     # 5 MiB exercises the on-disk object store and the 64 MiB IPC framing end to end.
     payload = os.urandom(5 * 1024 * 1024)
 
-    assert cache.set(query, payload) is True
-    got = cache.get(query)
+    assert await cache.set(query, payload) is True
+    got = await cache.get(query)
     assert got is not None
     assert len(got) == 5 * 1024 * 1024
     assert got == payload
 
 
 @pytest.mark.needs_model
-def test_context_assisted_hit_roundtrips(make_cache):
+async def test_context_assisted_hit_roundtrips(make_cache):
     cache = make_cache("context")
     query = CacheQuery(
         query="what dose should the patient take",
         context="patient is currently on warfarin therapy",
     )
 
-    assert cache.set(query, b"5mg daily") is True
-    assert cache.get(query) == b"5mg daily"
+    assert await cache.set(query, b"5mg daily") is True
+    assert await cache.get(query) == b"5mg daily"
 
 
 @pytest.mark.needs_model
-def test_keys_filter_isolates_entries_for_same_query(make_cache):
+async def test_keys_filter_isolates_entries_for_same_query(make_cache):
     cache = make_cache("keys")
     text = "what is the patient's current medication"
     v1 = CacheQuery(query=text, keys={"v1"})
@@ -136,23 +149,23 @@ def test_keys_filter_isolates_entries_for_same_query(make_cache):
 
     # Same query text, disjoint `keys`: the deterministic id keys on query+keys, so
     # these are two distinct entries the keys filter keeps apart.
-    assert cache.set(v1, b"aspirin") is True
-    assert cache.set(v2, b"ibuprofen") is True
+    assert await cache.set(v1, b"aspirin") is True
+    assert await cache.set(v2, b"ibuprofen") is True
 
-    assert cache.get(v1) == b"aspirin"
-    assert cache.get(v2) == b"ibuprofen"
+    assert await cache.get(v1) == b"aspirin"
+    assert await cache.get(v2) == b"ibuprofen"
 
 
 @pytest.mark.needs_model
-def test_distinct_namespaces_isolate_entries(make_cache):
+async def test_distinct_namespaces_isolate_entries(make_cache):
     # Two caches share one daemon and object root but use different namespaces; the
     # same query+keys yields the same id, so only namespacing keeps them apart.
     cache_alpha = make_cache("alpha")
     cache_beta = make_cache("beta")
     query = CacheQuery(query="what is the capital of france")
 
-    assert cache_alpha.set(query, b"paris") is True
-    assert cache_beta.set(query, b"berlin") is True
+    assert await cache_alpha.set(query, b"paris") is True
+    assert await cache_beta.set(query, b"berlin") is True
 
-    assert cache_alpha.get(query) == b"paris"
-    assert cache_beta.get(query) == b"berlin"
+    assert await cache_alpha.get(query) == b"paris"
+    assert await cache_beta.get(query) == b"berlin"

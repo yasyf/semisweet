@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "semisweet"
-description = "An in-memory semantic cache backed by turbopuffer."
+description = "An async, in-memory semantic cache with pluggable backends."
 readme = "README.md"
 # Matches the abi3-py39 floor in Cargo.toml. No upper cap: a stable-ABI wheel is
 # forward-compatible (runs on 3.9 through 3.14+).
@@ -47,8 +47,11 @@ manifest-path = "Cargo.toml"
 # venv after `maturin develop`; without this the `pytest` invocation is `command not
 # found`. Kept out of [project] so the published wheel carries no test deps.
 [dependency-groups]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["needs_model: requires the local BGE model cached on disk"]
+# The async get/set/delete roundtrip tests are plain `async def`; auto mode runs them
+# under pytest-asyncio without a per-test marker.
+asyncio_mode = "auto"

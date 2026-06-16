@@ -110,28 +110,29 @@ fn del_request(query: &str) -> Request {
     }
 }
 
-fn assert_hit(stub: &mut ClientStub, query: &str, expected: &[u8]) {
+async fn assert_hit(stub: &mut ClientStub, query: &str, expected: &[u8]) {
     assert_eq!(
-        stub.request(&get_request(query)).unwrap(),
+        stub.request(&get_request(query)).await.unwrap(),
         Response::Value(Some(serde_bytes::ByteBuf::from(expected.to_vec()))),
         "read-after-write: get should return the just-set value with no polling"
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs BGE model"]
-fn serving_roundtrips_over_the_real_daemon() {
+async fn serving_roundtrips_over_the_real_daemon() {
     let env = TestEnv::new(120);
     let objects = env.dir.join("objects");
     let config_json = serde_json::to_string(&disk_config(objects.to_str().unwrap())).unwrap();
 
-    let mut stub = connect_or_spawn(&env.launcher()).unwrap();
+    let mut stub = connect_or_spawn(&env.launcher()).await.unwrap();
 
     let registered = stub
         .request(&Request::RegisterNamespace {
             namespace: NAMESPACE.to_owned(),
             config_json,
         })
+        .await
         .unwrap();
     assert_eq!(registered, Response::Registered);
 
@@ -140,25 +141,30 @@ fn serving_roundtrips_over_the_real_daemon() {
     let paris = b"paris".to_vec();
     assert_eq!(
         stub.request(&set_request("what is the capital of france", paris.clone()))
+            .await
             .unwrap(),
         Response::Accepted(true)
     );
-    assert_hit(&mut stub, "what is the capital of france", &paris);
+    assert_hit(&mut stub, "what is the capital of france", &paris).await;
 
     // (ii) an unrelated query misses.
     assert_eq!(
-        stub.request(&get_request("how do tides work")).unwrap(),
+        stub.request(&get_request("how do tides work"))
+            .await
+            .unwrap(),
         Response::Value(None)
     );
 
     // (iii) delete removes the entry; the next get misses.
     assert_eq!(
         stub.request(&del_request("what is the capital of france"))
+            .await
             .unwrap(),
         Response::Deleted(true)
     );
     assert_eq!(
         stub.request(&get_request("what is the capital of france"))
+            .await
             .unwrap(),
         Response::Value(None)
     );
@@ -167,10 +173,11 @@ fn serving_roundtrips_over_the_real_daemon() {
     let large: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     assert_eq!(
         stub.request(&set_request("a very large blob", large.clone()))
+            .await
             .unwrap(),
         Response::Accepted(true)
     );
-    assert_hit(&mut stub, "a very large blob", &large);
+    assert_hit(&mut stub, "a very large blob", &large).await;
 
-    stub.bye().unwrap();
+    stub.bye().await.unwrap();
 }

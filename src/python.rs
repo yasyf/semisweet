@@ -10,17 +10,24 @@
 //! serde `*Choice` config the daemon understands. Every argument is optional; an
 //! omitted axis falls back to the fully-local default.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
 
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use pyo3::prelude::*;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::client::{ClientStub, Launcher, connect_or_spawn};
 use crate::error::{Error, Result};
 use crate::newtype::{Context, Key, Namespace, QueryText};
+use crate::paths;
 use crate::protocol::{Request, Response};
 use crate::registry::{
     EmbeddingChoice, EntityChoice, NamespaceConfig, ObjectChoice, ScoringDto, VectorChoice,
@@ -35,17 +42,54 @@ const DEFAULT_GLINER_LABELS: [&str; 6] = [
     "event",
 ];
 
-fn register(
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+type Conn = Arc<Mutex<ClientStub>>;
+type ConnCell = Arc<OnceCell<Conn>>;
+
+// Lazily connect and register the namespace exactly once. `get_or_try_init` leaves the
+// cell empty on failure, so a later call retries instead of caching a poisoned stub.
+async fn connect(
+    conn: ConnCell,
     executable: PathBuf,
     namespace: String,
     config_json: String,
-) -> Result<(ClientStub, Response)> {
-    let mut stub = connect_or_spawn(&Launcher::Python { executable })?;
-    let response = stub.request(&Request::RegisterNamespace {
-        namespace,
-        config_json,
-    })?;
-    Ok((stub, response))
+) -> PyResult<Conn> {
+    let stub = conn
+        .get_or_try_init(|| async move {
+            let mut stub = connect_or_spawn(&Launcher::Python { executable }).await?;
+            match stub
+                .request(&Request::RegisterNamespace {
+                    namespace,
+                    config_json,
+                })
+                .await?
+            {
+                Response::Registered => Ok::<Conn, PyErr>(Arc::new(Mutex::new(stub))),
+                Response::Error(error) => Err(error.into()),
+                other => Err(Error::Daemon(format!(
+                    "unexpected response to RegisterNamespace: {other:?}"
+                ))
+                .into()),
+            }
+        })
+        .await?;
+    Ok(stub.clone())
+}
+
+// The async-aware mutex held across the round-trip keeps a single connection
+// unmultiplexed; concurrency comes from multiple `SemanticCache` objects.
+async fn round_trip(
+    conn: ConnCell,
+    executable: PathBuf,
+    namespace: String,
+    config_json: String,
+    request: Request,
+) -> PyResult<Response> {
+    let stub = connect(conn, executable, namespace, config_json).await?;
+    let mut guard = stub.lock().await;
+    Ok(guard.request(&request).await?)
 }
 
 fn py_bool(value: bool) -> &'static str {
@@ -203,8 +247,7 @@ impl PyCacheQuery {
     fn __eq__(&self, other: &Self) -> bool {
         self.query == other.query
             && self.context == other.context
-            && self.keys.iter().collect::<HashSet<_>>()
-                == other.keys.iter().collect::<HashSet<_>>()
+            && self.keys.iter().collect::<HashSet<_>>() == other.keys.iter().collect::<HashSet<_>>()
     }
 
     /// Hash consistent with `__eq__` (keys hashed as a set).
@@ -669,36 +712,18 @@ impl PyScoring {
 ///
 /// Construct it with keyword-only backend objects: `namespace` (str, required),
 /// `embedding`, `entities`, `vectors`, `storage`, and `scoring`. Every backend is
-/// optional and falls back to a fully-local default. Construction spawns or connects
-/// the daemon and registers the namespace, which on a cold cache triggers a BLOCKING
-/// model download from Hugging Face for the local embedding and GLiNER backends; set
-/// the `SEMISWEET_MODEL_CACHE` env var to control where the weights are cached.
-///
-/// Usable as a context manager: `with SemanticCache(namespace='ns') as cache: ...`
-/// closes the daemon connection on exit. Raises `ConfigError` for an invalid namespace
-/// or backend config and `DaemonError` for daemon or IO failures.
-#[pyclass(name = "SemanticCache")]
+/// optional and falls back to a fully-local default. Construction is pure, synchronous
+/// configuration and performs no I/O. The first awaited `get`/`set`/`delete` lazily
+/// spawns or connects the shared daemon and registers the namespace, which on a cold
+/// cache triggers a model download from Hugging Face for the local embedding and GLiNER
+/// backends; set the `SEMISWEET_MODEL_CACHE` env var to control where the weights are
+/// cached. Raises `ConfigError` for an invalid namespace or backend config.
+#[pyclass(name = "SemanticCache", subclass)]
 pub(crate) struct PySemanticCache {
     namespace: String,
-    stub: Mutex<ClientStub>,
-}
-
-impl PySemanticCache {
-    fn round_trip(&self, request: &Request) -> Result<Response> {
-        let mut stub = self
-            .stub
-            .lock()
-            .map_err(|_| Error::Daemon("client connection mutex poisoned".to_owned()))?;
-        stub.request(request)
-    }
-
-    fn disconnect(&self) -> Result<()> {
-        let mut stub = self
-            .stub
-            .lock()
-            .map_err(|_| Error::Daemon("client connection mutex poisoned".to_owned()))?;
-        stub.bye()
-    }
+    config_json: String,
+    executable: PathBuf,
+    conn: ConnCell,
 }
 
 #[pymethods]
@@ -739,42 +764,52 @@ impl PySemanticCache {
             .getattr("executable")?
             .extract::<String>()?
             .into();
-        let register_namespace = namespace.clone();
-        let (stub, response) =
-            py.detach(move || register(executable, register_namespace, config_json))?;
-        match response {
-            Response::Registered => Ok(Self {
-                namespace,
-                stub: Mutex::new(stub),
-            }),
-            Response::Error(error) => Err(error.into()),
-            other => Err(Error::Daemon(format!(
-                "unexpected response to RegisterNamespace: {other:?}"
-            ))
-            .into()),
-        }
+        Ok(Self {
+            namespace,
+            config_json,
+            executable,
+            conn: Arc::new(OnceCell::new()),
+        })
     }
 
     /// Look up the cached value for `query`. Returns the stored `bytes` on a semantic
     /// hit, or `None` on a miss. Raises `BackendError`/`DaemonError` on failure.
-    fn get(&self, py: Python<'_>, query: &PyCacheQuery) -> PyResult<Option<Vec<u8>>> {
+    fn get<'py>(&self, py: Python<'py>, query: &PyCacheQuery) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.conn.clone();
+        let executable = self.executable.clone();
+        let namespace = self.namespace.clone();
+        let config_json = self.config_json.clone();
         let request = Request::Get {
             namespace: self.namespace.clone(),
             query: query.query.clone(),
             keys: query.keys.clone(),
             context: query.context.clone(),
         };
-        let response = py.detach(|| self.round_trip(&request))?;
-        match response {
-            Response::Value(value) => Ok(value.map(|buf| buf.into_vec())),
-            Response::Error(error) => Err(error.into()),
-            other => Err(Error::Daemon(format!("unexpected response to Get: {other:?}")).into()),
-        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match round_trip(conn, executable, namespace, config_json, request).await? {
+                Response::Value(value) => {
+                    Ok(value.map(|buf| Cow::<'static, [u8]>::Owned(buf.into_vec())))
+                }
+                Response::Error(error) => Err(error.into()),
+                other => {
+                    Err(Error::Daemon(format!("unexpected response to Get: {other:?}")).into())
+                }
+            }
+        })
     }
 
     /// Store `value` (`bytes`) under `query`. Returns `True` if the daemon accepted the
     /// write. Raises `BackendError`/`DaemonError` on failure.
-    fn set(&self, py: Python<'_>, query: &PyCacheQuery, value: Vec<u8>) -> PyResult<bool> {
+    fn set<'py>(
+        &self,
+        py: Python<'py>,
+        query: &PyCacheQuery,
+        value: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.conn.clone();
+        let executable = self.executable.clone();
+        let namespace = self.namespace.clone();
+        let config_json = self.config_json.clone();
         let request = Request::Set {
             namespace: self.namespace.clone(),
             query: query.query.clone(),
@@ -782,60 +817,95 @@ impl PySemanticCache {
             context: query.context.clone(),
             value: serde_bytes::ByteBuf::from(value),
         };
-        let response = py.detach(|| self.round_trip(&request))?;
-        match response {
-            Response::Accepted(accepted) => Ok(accepted),
-            Response::Error(error) => Err(error.into()),
-            other => Err(Error::Daemon(format!("unexpected response to Set: {other:?}")).into()),
-        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match round_trip(conn, executable, namespace, config_json, request).await? {
+                Response::Accepted(accepted) => Ok(accepted),
+                Response::Error(error) => Err(error.into()),
+                other => {
+                    Err(Error::Daemon(format!("unexpected response to Set: {other:?}")).into())
+                }
+            }
+        })
     }
 
     /// Evict the entry matching `query`. Returns `True` if an entry was removed. Raises
     /// `BackendError`/`DaemonError` on failure.
-    fn delete(&self, py: Python<'_>, query: &PyCacheQuery) -> PyResult<bool> {
+    fn delete<'py>(&self, py: Python<'py>, query: &PyCacheQuery) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.conn.clone();
+        let executable = self.executable.clone();
+        let namespace = self.namespace.clone();
+        let config_json = self.config_json.clone();
         let request = Request::Del {
             namespace: self.namespace.clone(),
             query: query.query.clone(),
             keys: query.keys.clone(),
             context: query.context.clone(),
         };
-        let response = py.detach(|| self.round_trip(&request))?;
-        match response {
-            Response::Deleted(deleted) => Ok(deleted),
-            Response::Error(error) => Err(error.into()),
-            other => Err(Error::Daemon(format!("unexpected response to Del: {other:?}")).into()),
-        }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match round_trip(conn, executable, namespace, config_json, request).await? {
+                Response::Deleted(deleted) => Ok(deleted),
+                Response::Error(error) => Err(error.into()),
+                other => {
+                    Err(Error::Daemon(format!("unexpected response to Del: {other:?}")).into())
+                }
+            }
+        })
     }
 
     /// Render the cache's namespace.
     fn __repr__(&self) -> String {
         format!("SemanticCache(namespace='{}')", self.namespace)
     }
+}
 
-    /// Send a graceful goodbye so the daemon sheds this connection. A later operation
-    /// transparently reconnects. Raises `DaemonError` if the goodbye fails.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.disconnect())?;
-        Ok(())
+// SIGTERM the running daemon via its pid file; the supervisor drains gracefully. A
+// missing pid file, a malformed pid, or ESRCH means "no daemon" and returns false.
+fn signal_daemon() -> Result<bool> {
+    let pid_path = paths::pid_path()?;
+    let raw = match std::fs::read_to_string(&pid_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let pid = match raw.trim().parse::<i32>() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(false),
+    };
+    match signal::kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(errno) => Err(Error::Daemon(format!("failed to signal daemon: {errno}"))),
     }
+}
 
-    /// Return self for use as a context manager.
-    fn __enter__(slf: Py<Self>) -> Py<Self> {
-        slf
+async fn shutdown() -> Result<bool> {
+    let signaled = tokio::task::spawn_blocking(signal_daemon)
+        .await
+        .map_err(|error| Error::Daemon(format!("shutdown task failed: {error}")))??;
+    if !signaled {
+        return Ok(false);
     }
+    let socket = paths::socket_path()?;
+    let pid_path = paths::pid_path()?;
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if !socket.exists() && !pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
+    Ok(true)
+}
 
-    /// Close the daemon connection on exit. Returns `False` so a pending exception is
-    /// not suppressed.
-    fn __exit__(
-        &self,
-        py: Python<'_>,
-        _exc_type: &Bound<'_, PyAny>,
-        _exc_value: &Bound<'_, PyAny>,
-        _traceback: &Bound<'_, PyAny>,
-    ) -> PyResult<bool> {
-        self.close(py)?;
-        Ok(false)
-    }
+/// Signal the shared daemon to shut down via its pid file. Returns `True` if a running
+/// daemon was signaled, `False` if none was running. The daemon idle-shuts-down on its
+/// own, so most callers never need this.
+#[pyfunction]
+pub(crate) fn shutdown_daemon(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let stopped = shutdown().await?;
+        Ok(stopped)
+    })
 }
 
 #[pyfunction]

@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::thread;
 
 use semisweet::{
     EmbeddingChoice, EntityChoice, Launcher, NamespaceConfig, ObjectChoice, Request, Response,
@@ -38,14 +37,17 @@ fn item(namespace: &str, thread: usize, index: usize) -> (String, String, Vec<u8
     (query, key, value)
 }
 
-fn register(namespace: &str, config: &NamespaceConfig) {
-    let mut stub = connect_or_spawn(&launcher()).expect("connect to daemon");
+async fn register(namespace: &str, config: &NamespaceConfig) {
+    let mut stub = connect_or_spawn(&launcher())
+        .await
+        .expect("connect to daemon");
     let config_json = serde_json::to_string(config).unwrap();
     let response = stub
         .request(&Request::RegisterNamespace {
             namespace: namespace.to_owned(),
             config_json,
         })
+        .await
         .expect("register namespace");
     assert_eq!(
         response,
@@ -56,13 +58,13 @@ fn register(namespace: &str, config: &NamespaceConfig) {
 
 /// Hammer one namespace from `THREADS` independent client connections, asserting
 /// read-after-write on every set, then delete everything from a fresh connection.
-fn hammer(namespace: &str, label: &str) {
+async fn hammer(namespace: &str, label: &str) {
     let handles: Vec<_> = (0..THREADS)
         .map(|worker| {
             let namespace = namespace.to_owned();
             let label = label.to_owned();
-            thread::spawn(move || {
-                let mut stub = connect_or_spawn(&launcher()).expect("worker connect");
+            tokio::spawn(async move {
+                let mut stub = connect_or_spawn(&launcher()).await.expect("worker connect");
                 for index in 0..PER_THREAD {
                     let (query, key, value) = item(&namespace, worker, index);
                     let accepted = stub
@@ -73,6 +75,7 @@ fn hammer(namespace: &str, label: &str) {
                             context: None,
                             value: serde_bytes::ByteBuf::from(value.clone()),
                         })
+                        .await
                         .expect("set");
                     assert_eq!(accepted, Response::Accepted(true), "{label}: set accepted");
 
@@ -83,6 +86,7 @@ fn hammer(namespace: &str, label: &str) {
                             keys: vec![key],
                             context: None,
                         })
+                        .await
                         .expect("get");
                     assert_eq!(
                         got,
@@ -94,12 +98,14 @@ fn hammer(namespace: &str, label: &str) {
         })
         .collect();
     for handle in handles {
-        handle.join().expect("worker thread");
+        handle.await.expect("worker task");
     }
 
     // Cleanup from one connection: delete removes the pending shadow and makes the
     // matching write-behind job skip, so the entries do not accumulate in any backend.
-    let mut stub = connect_or_spawn(&launcher()).expect("cleanup connect");
+    let mut stub = connect_or_spawn(&launcher())
+        .await
+        .expect("cleanup connect");
     for worker in 0..THREADS {
         for index in 0..PER_THREAD {
             let (query, key, _) = item(namespace, worker, index);
@@ -109,6 +115,7 @@ fn hammer(namespace: &str, label: &str) {
                 keys: vec![key],
                 context: None,
             })
+            .await
             .expect("delete");
         }
     }
@@ -143,33 +150,40 @@ fn gliner_labels() -> Vec<String> {
         .collect()
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "load test: needs model downloads, and live keys / docker for some combos"]
-fn all_backend_combos_under_load() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+async fn all_backend_combos_under_load() {
     let dir = std::env::temp_dir().join(format!("ssload-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let objects = dir.join("objects");
     let objects = objects.to_str().unwrap().to_owned();
 
-    // Bring up MinIO (if Docker is present) before the daemon spawns, so the daemon
-    // inherits the S3 endpoint/credentials it needs to build the S3 object store.
-    let minio = start_minio();
+    // Hold ENV_LOCK only while mutating the process environment: the daemon reads the
+    // overrides when it spawns (during the awaits below), the MinIO container outlives
+    // the guard, and this is the only test in this binary touching the environment.
+    let (minio, voyage, turbopuffer) = {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
-    // SAFETY: serialized by ENV_LOCK; no other thread touches the environment here.
-    unsafe {
-        std::env::set_var("SEMISWEET_SOCKET", dir.join("d.sock"));
-        std::env::set_var("SEMISWEET_LOCK", dir.join("d.lock"));
-        std::env::set_var("SEMISWEET_LOG", dir.join("d.log"));
-        std::env::set_var("SEMISWEET_IDLE_SECS", "120");
-        std::env::set_var(
-            "SEMISWEET_MODEL_CACHE",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/.fastembed_cache"),
-        );
-    }
+        // Bring up MinIO (if Docker is present) before the daemon spawns, so the daemon
+        // inherits the S3 endpoint/credentials it needs to build the S3 object store.
+        let minio = start_minio();
 
-    let voyage = std::env::var_os("VOYAGE_API_KEY").is_some();
-    let turbopuffer = std::env::var_os("TURBOPUFFER_API_KEY").is_some();
+        // SAFETY: serialized by ENV_LOCK; no other thread touches the environment here.
+        unsafe {
+            std::env::set_var("SEMISWEET_SOCKET", dir.join("d.sock"));
+            std::env::set_var("SEMISWEET_LOCK", dir.join("d.lock"));
+            std::env::set_var("SEMISWEET_LOG", dir.join("d.log"));
+            std::env::set_var("SEMISWEET_IDLE_SECS", "120");
+            std::env::set_var(
+                "SEMISWEET_MODEL_CACHE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/.fastembed_cache"),
+            );
+        }
+
+        let voyage = std::env::var_os("VOYAGE_API_KEY").is_some();
+        let turbopuffer = std::env::var_os("TURBOPUFFER_API_KEY").is_some();
+        (minio, voyage, turbopuffer)
+    };
 
     // Always-available local combos (BGE + keyword/GLiNER auto-download).
     register(
@@ -180,11 +194,13 @@ fn all_backend_combos_under_load() {
             VectorChoice::Memory,
             &objects,
         ),
-    );
+    )
+    .await;
     hammer(
         "load-local-keyword-memory",
         "local + keyword + memory + disk",
-    );
+    )
+    .await;
 
     register(
         "load-local-gliner-memory",
@@ -199,8 +215,9 @@ fn all_backend_combos_under_load() {
             VectorChoice::Memory,
             &objects,
         ),
-    );
-    hammer("load-local-gliner-memory", "local + gliner + memory + disk");
+    )
+    .await;
+    hammer("load-local-gliner-memory", "local + gliner + memory + disk").await;
 
     if voyage {
         register(
@@ -214,11 +231,13 @@ fn all_backend_combos_under_load() {
                 VectorChoice::Memory,
                 &objects,
             ),
-        );
+        )
+        .await;
         hammer(
             "load-voyage-keyword-memory",
             "voyage + keyword + memory + disk",
-        );
+        )
+        .await;
     } else {
         println!("[load] skip voyage combos: VOYAGE_API_KEY unset");
     }
@@ -232,11 +251,13 @@ fn all_backend_combos_under_load() {
                 VectorChoice::Turbopuffer,
                 &objects,
             ),
-        );
+        )
+        .await;
         hammer(
             "load-local-keyword-turbopuffer",
             "local + keyword + turbopuffer + disk",
-        );
+        )
+        .await;
     } else {
         println!("[load] skip turbopuffer combos: TURBOPUFFER_API_KEY unset");
     }
@@ -256,11 +277,13 @@ fn all_backend_combos_under_load() {
                 },
                 scoring: ScoringDto::default(),
             },
-        );
+        )
+        .await;
         hammer(
             "load-local-keyword-s3",
             "local + keyword + memory + s3 (minio)",
-        );
+        )
+        .await;
     } else {
         println!("[load] skip s3 combo: Docker/MinIO unavailable");
     }
