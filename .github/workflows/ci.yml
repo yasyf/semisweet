@@ -52,11 +52,11 @@ jobs:
       - name: cargo clippy (all features, warnings as errors)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # Default features: 95 pass, 4 ignored (live Voyage/turbopuffer, MinIO, BGE).
+      # Default features: 98 pass, 5 ignored (live Voyage/turbopuffer, MinIO, BGE).
       - name: cargo test (default features)
         run: cargo test
 
-      # All features: 97 pass, 6 ignored. The ignored tests need live keys, Docker, or
+      # All features: 100 pass, 6 ignored. The ignored tests need live keys, Docker, or
       # model downloads; they stay ignored here, so only the offline tests run.
       - name: cargo test (all features)
         run: cargo test --all-features
@@ -77,18 +77,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Default features only: the import smoke test and the two eager-validation
-      # pytest cases (ValueError) need no model, so this build skips the ort download
-      # and stays deterministic. The BGE-backed roundtrip tests self-skip via
-      # @needs_model because .fastembed_cache is empty here; python-model-e2e runs them.
       - name: build + install semisweet into the venv
         run: uvx maturin develop --uv
 
       - name: import smoke test
         run: python -c "import semisweet"
 
-      # Required surface: the two offline ValueError cases run; the three model-backed
-      # cases self-skip (no BGE on disk). Deterministic, no network at test time.
+      # maturin installs only the extension; pytest must be added explicitly or the
+      # next step is `pytest: command not found`.
+      - name: install test deps
+        run: uv pip install pytest
+
+      # The construction/validation cases run; the BGE-backed roundtrip cases self-skip
+      # via @needs_model (no model on disk here). Deterministic, no network at test time.
       - name: pytest (offline; model-backed tests self-skip)
         run: pytest tests/ -v
 
@@ -125,10 +126,13 @@ jobs:
         env:
           SEMISWEET_MODEL_CACHE: ${{ github.workspace }}/.fastembed_cache
 
-      # local-embed so the in-process daemon (semisweet._run_daemon) carries the BGE
-      # backend the builder selects.
+      # local-embed is already a default feature, but naming it keeps this job explicit
+      # about the in-process daemon (semisweet._run_daemon) carrying the BGE backend.
       - name: build + install semisweet (local-embed) into the venv
         run: uvx maturin develop --uv --features local-embed
+
+      - name: install test deps
+        run: uv pip install pytest
 
       # Full suite: BGE-backed roundtrip + the offline cases. The fixture monkeypatches
       # SEMISWEET_MODEL_CACHE to .fastembed_cache; HF_HOME gives hf-hub a writable home.
@@ -193,3 +197,34 @@ jobs:
       # at .fastembed_cache itself, so the cached/downloaded BGE is reused.
       - name: cargo test (daemon serving roundtrip)
         run: cargo test --features local-embed --test daemon_serving -- --ignored
+
+  rust-gliner-e2e:
+    name: rust gliner e2e (HF auto-download) [non-blocking]
+    runs-on: ubuntu-latest
+    # Non-blocking: depends on the GLiNER model download from the Hugging Face Hub.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.90.0
+
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.13"
+          activate-environment: true
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cache GLiNER model
+        uses: actions/cache@v4
+        with:
+          path: .hf_home
+          key: gliner-small-v2.1-v1
+
+      # GlinerEntities auto-downloads onnx/model.onnx + tokenizer.json from the Hub on
+      # first construction (no env paths). HF_HOME gives hf-hub a writable, cached home.
+      - name: cargo test (GLiNER auto-download + extract)
+        run: cargo test --features gliner --lib extract_fast_is_subset_of_full_end_to_end -- --ignored
+        env:
+          HF_HOME: ${{ github.workspace }}/.hf_home
