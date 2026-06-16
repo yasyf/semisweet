@@ -52,6 +52,8 @@ pub enum Error {
     VectorStorage(#[source] BackendError),
     #[error("object storage failed")]
     ObjectStorage(#[source] BackendError),
+    #[error("compression failed")]
+    Compression(#[source] BackendError),
     #[error("daemon is shutting down")]
     DaemonShutdown,
     #[error("daemon lifecycle error: {0}")]
@@ -108,7 +110,8 @@ impl From<Error> for PyErr {
             Error::EntityExtraction(_)
             | Error::Embedding(_)
             | Error::VectorStorage(_)
-            | Error::ObjectStorage(_) => build(&BACKEND_ERROR, PyRuntimeError::new_err, message),
+            | Error::ObjectStorage(_)
+            | Error::Compression(_) => build(&BACKEND_ERROR, PyRuntimeError::new_err, message),
             Error::DaemonShutdown | Error::Daemon(_) | Error::Io(_) | Error::Codec(_) => {
                 build(&DAEMON_ERROR, PyRuntimeError::new_err, message)
             }

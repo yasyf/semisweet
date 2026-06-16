@@ -70,6 +70,7 @@ fn is_transient_drop(error: &Error) -> bool {
         | Error::Embedding(_)
         | Error::VectorStorage(_)
         | Error::ObjectStorage(_)
+        | Error::Compression(_)
         | Error::DaemonShutdown
         | Error::Daemon(_)
         | Error::ProtocolVersionMismatch { .. } => false,

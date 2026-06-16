@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
+use crate::compression::CompressedStore;
 use crate::embedding::EmbeddingBackend;
 use crate::entity::EntityBackend;
 use crate::error::{Error, Result};
@@ -19,7 +20,9 @@ use crate::object::ObjectStorageBackend;
 use crate::scoring::{ContextMode, ScoringConfig};
 use crate::vector::VectorStorageBackend;
 
+#[cfg(feature = "voyage")]
 const DEFAULT_VOYAGE_MODEL: &str = "voyage-3.5-lite";
+#[cfg(feature = "voyage")]
 const DEFAULT_VOYAGE_DIM: usize = 512;
 
 pub type DynCache = Cache<
@@ -299,22 +302,23 @@ fn build_turbopuffer() -> Result<Arc<dyn VectorStorageBackend>> {
 }
 
 fn build_object(choice: &ObjectChoice) -> Result<Arc<dyn ObjectStorageBackend>> {
-    match choice {
+    let inner: Arc<dyn ObjectStorageBackend> = match choice {
         ObjectChoice::Disk { root } => {
             use crate::backends::object_disk::DiskObjectStore;
             let store = match root {
                 Some(root) => DiskObjectStore::new(PathBuf::from(root)),
                 None => DiskObjectStore::with_default_root()?,
             };
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectChoice::S3 {
             bucket,
             region,
             endpoint,
             prefix,
-        } => build_s3(bucket.clone(), region.clone(), endpoint.clone(), prefix),
-    }
+        } => build_s3(bucket.clone(), region.clone(), endpoint.clone(), prefix)?,
+    };
+    Ok(Arc::new(CompressedStore::new(inner)))
 }
 
 #[cfg(feature = "s3")]

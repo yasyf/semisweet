@@ -31,6 +31,10 @@ pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v5", "v4"] }
+# zstd compresses every value payload before it reaches the object store. The crate
+# vendors its C source via zstd-sys (no system libzstd), matching the project's
+# rustls/bundled-ONNX "no system C library" stance.
+zstd = "0.13"
 
 # --- Daemon core (non-optional; the lazily-started orphan daemon is essential) ---
 

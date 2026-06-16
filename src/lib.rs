@@ -6,6 +6,7 @@ use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 mod backends;
 mod cache;
 mod client;
+mod compression;
 mod daemon;
 mod embedding;
 mod entity;

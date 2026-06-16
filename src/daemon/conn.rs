@@ -382,6 +382,7 @@ fn backend_error(error: Error) -> Response {
         | Error::Embedding(_)
         | Error::VectorStorage(_)
         | Error::ObjectStorage(_)
+        | Error::Compression(_)
         | Error::DaemonShutdown
         | Error::Daemon(_)
         | Error::Io(_)
