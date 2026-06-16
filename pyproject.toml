@@ -1,0 +1,39 @@
+[build-system]
+# >=1.9.4 is the minimum that auto-handles the (now-deprecated) extension-module
+# linkage; the current latest, 1.14.0, resolves within this constraint.
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "semisweet"
+description = "An in-memory semantic cache backed by turbopuffer."
+readme = "README.md"
+# Matches the abi3-py39 floor in Cargo.toml. No upper cap: a stable-ABI wheel is
+# forward-compatible (runs on 3.9 through 3.14+).
+requires-python = ">=3.9"
+# PEP 639 SPDX expression string. "PolyForm-Noncommercial-1.0.0" is a valid SPDX
+# identifier, so the string form (not the deprecated {text=...} table) is correct.
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Yasyf Mohamedali", email = "yasyfm@gmail.com" }]
+# Version is sourced from Cargo.toml [package].version by maturin.
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+[project.urls]
+Homepage = "https://github.com/yasyf/semisweet"
+Repository = "https://github.com/yasyf/semisweet"
+Issues = "https://github.com/yasyf/semisweet/issues"
+
+[tool.maturin]
+# Import module == crate name == "semisweet" (pure-Rust, single top-level module).
+module-name = "semisweet"
+manifest-path = "Cargo.toml"
+# No `features` key: extension-module is deprecated/auto-handled, and the abi3-py39
+# floor is already a default feature in Cargo.toml (single source of truth).
+# No `python-source`: pure-Rust layout has no Python package directory.
