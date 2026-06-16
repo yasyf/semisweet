@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # cargo test/clippy compile pyo3 in non-extension-module mode, so they link
+      # a real interpreter. It only needs to be >= the crate's abi3 floor (py39);
+      # uv provides 3.13, which satisfies it. activate-environment puts it on PATH
+      # and exports VIRTUAL_ENV so pyo3's build script selects it.
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.13"
+          activate-environment: true
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # --all-targets lints the test code too. There is no extension-module
+      # feature to toggle (pyo3 0.29 deprecated it); maturin sets
+      # PYO3_BUILD_EXTENSION_MODULE only for the wheel build in the `python` job,
+      # so a bare clippy/test here links libpython and runs against 3.13.
+      - name: cargo clippy (warnings as errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+  python:
+    name: python (maturin build + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.13"
+          activate-environment: true
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Builds the abi3 extension (maturin sets PYO3_BUILD_EXTENSION_MODULE) and
+      # installs it into the activated venv, using uv as the installer.
+      - name: build + install semisweet into the venv
+        run: uvx maturin develop --uv
+
+      - name: import smoke test
+        run: python -c "import semisweet"
