@@ -21,33 +21,29 @@ cd semisweet
 uv venv && uvx maturin develop --uv
 ```
 
-The default wheel is pure Rust plus HTTP (Voyage embeddings, turbopuffer, on-disk and S3 object storage, YAKE keyword entities) and installs as a single abi3 wheel for Python 3.9+. To embed locally on CPU with BGE-small instead of calling Voyage, compile the ONNX backend in:
+The default build is batteries-included: a bare `SemanticCache(namespace="...")` runs fully offline on local BGE-small embeddings, YAKE keyword entities, an in-process index, and on-disk payloads — no API keys, no config. The Voyage, turbopuffer, and S3 backends compile in alongside it, and the whole thing installs as a single abi3 wheel for Python 3.9+. Opt into GLiNER span-label entities with one extra feature:
 
 ```bash
-uvx maturin develop --uv --features local-embed
+uvx maturin develop --uv --features gliner
 ```
 
 ## Quickstart
 
-Build a fully in-process cache — local embeddings, keyword entities, an in-memory index, on-disk payloads — then store a value and read it back through a differently worded query. This path needs the `local-embed` build above and no API keys.
+Build a fully in-process cache, store a value, and read it back through a differently worded query. The defaults — local BGE embeddings, keyword entities, an in-process index, on-disk payloads — need no API keys, so a bare namespace is the whole setup.
 
 ```python
 import semisweet
 
-cache = (
-    semisweet.SemanticCache.builder("research-cache")
-    .embedding_local()       # BGE-small on CPU
-    .entities_keyword(None)  # YAKE keyword extraction
-    .vector_memory()         # in-process vector index
-    .object_disk(None)       # payloads under the user data dir
-    .build()
-)
+# Every backend defaults, so a namespace is all you need. Pass LocalEmbedding,
+# KeywordEntities, MemoryVectors, or DiskStorage to override an axis.
+cache = semisweet.SemanticCache(namespace="research-cache")
 
-# `set` is write-behind: it returns as soon as the daemon accepts the write.
-cache.set(semisweet.CacheQuery("what is the capital of france", set()), b"paris")
+# `set` is read-after-write: a `get` for the same query returns the value at once,
+# while the durable write drains in the background.
+cache.set(semisweet.CacheQuery(query="what is the capital of france"), b"paris")
 
 # A reworded query still hits the stored entry.
-hit = cache.get(semisweet.CacheQuery("france's capital?", set()))
+hit = cache.get(semisweet.CacheQuery(query="france's capital?"))
 print(hit)
 ```
 
@@ -55,27 +51,26 @@ print(hit)
 b'paris'
 ```
 
-`CacheQuery(query, keys, context=None)` carries the text to match on, a set of exact-match filter tags, and optional fallback text. `keys` is a contains-all filter — an entry matches only when it carries every key in the query — and `context` feeds entity extraction and breaks lexical ties when the query alone is thin. `get` returns the stored `bytes` on a hit or `None` on a miss; `delete` drops the entry and returns whether it existed.
+`CacheQuery(query=..., keys=..., context=...)` is keyword-only: `query` is the text to match on, `keys` an optional set of exact-match filter tags, `context` optional fallback text. `keys` is a contains-all filter — an entry matches only when it carries every key in the query — and `context` feeds entity extraction and breaks lexical ties when the query alone is thin. `get` returns the stored `bytes` on a hit or `None` on a miss; `delete` drops the entry and returns whether it existed.
 
 ## Backends
 
-semisweet has four pluggable backend axes, each chosen once on the builder. Eight builtins ship across them:
+semisweet has four pluggable backend axes, each set once by passing a backend object to `SemanticCache`. Eight builtins ship across them, every constructor keyword-only with all-optional arguments:
 
 | Axis | Builtins |
 |------|----------|
-| Embedding | `embedding_local()` — BGE-small on CPU (`--features local-embed`); `embedding_voyage(model, dim)` — Voyage HTTP API |
-| Entities | `entities_keyword(language)` — YAKE keywords; `entities_gliner(labels)` — GLiNER span labels (`--features gliner`) |
-| Vector index | `vector_memory()` — in-process; `vector_turbopuffer()` — turbopuffer |
-| Object store | `object_disk(root)` — local filesystem; `object_s3(bucket, region, endpoint, prefix)` — S3-compatible |
+| Embedding | `LocalEmbedding(model=...)` — BGE-small on CPU; `VoyageEmbedding(model=..., dim=...)` — Voyage HTTP API |
+| Entities | `KeywordEntities(lang=...)` — YAKE keywords; `GlinerEntities(labels=..., repo=...)` — GLiNER span labels (`--features gliner`) |
+| Vector index | `MemoryVectors()` — in-process; `TurbopufferVectors()` — turbopuffer |
+| Object store | `DiskStorage(root=...)` — local filesystem; `S3Storage(bucket=..., region=..., endpoint=..., prefix=...)` — S3-compatible |
 
-Payloads always live in the object store, so offload is first-class. The model-backed backends (`local-embed`, `gliner`) compile only behind their cargo features; the default wheel stays pure Rust plus HTTP. Each backend reads its credentials from the environment as you select it:
+Payloads always live in the object store, so offload is first-class. `LocalEmbedding` ships in the default build; `GlinerEntities` compiles behind the `gliner` cargo feature. Both download their model from the Hugging Face Hub on first use and run offline after — the same auto-download as fastembed's BGE, cached under `SEMISWEET_MODEL_CACHE`. Point `GlinerEntities` at a different model through its `repo` / `model` / `tokenizer` keywords. Each remote backend reads its credentials from the environment as you select it:
 
 | Variable | Read by |
 |----------|---------|
-| `VOYAGE_API_KEY` | `embedding_voyage` |
-| `TURBOPUFFER_API_KEY` | `vector_turbopuffer` |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT` | `object_s3` |
-| `SEMISWEET_GLINER_TOKENIZER`, `SEMISWEET_GLINER_MODEL` | `entities_gliner` |
+| `VOYAGE_API_KEY` | `VoyageEmbedding` |
+| `TURBOPUFFER_API_KEY` | `TurbopufferVectors` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_ENDPOINT`, `SEMISWEET_S3_BUCKET` | `S3Storage` |
 
 ## Architecture
 
@@ -87,7 +82,7 @@ Rust unit tests live beside the code in `src/`; Python binding tests live in `te
 
 ```bash
 cargo test
-uv venv && uvx maturin develop --uv && pytest
+uv venv && uvx maturin develop --uv && uv pip install pytest && pytest
 ```
 
 See [AGENTS.md](AGENTS.md) for the full conventions.
