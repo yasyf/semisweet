@@ -37,3 +37,13 @@ manifest-path = "Cargo.toml"
 # No `features` key: extension-module is deprecated/auto-handled, and the abi3-py39
 # floor is already a default feature in Cargo.toml (single source of truth).
 # No `python-source`: pure-Rust layout has no Python package directory.
+
+# Test-only dependencies (PEP 735). `uv pip install --group test` pulls pytest into the
+# venv after `maturin develop`; without this the `pytest` invocation is `command not
+# found`. Kept out of [project] so the published wheel carries no test deps.
+[dependency-groups]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["needs_model: requires the local BGE model cached on disk"]
