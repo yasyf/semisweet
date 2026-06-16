@@ -2,7 +2,7 @@
 name = "semisweet"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "An in-memory semantic cache backed by turbopuffer."
 authors = ["Yasyf Mohamedali <yasyfm@gmail.com>"]
 license = "PolyForm-Noncommercial-1.0.0"

@@ -50,10 +50,10 @@ where
         fast: bool,
     ) -> Result<BTreeSet<Entity>> {
         let entities = self.entity.extract(query.as_str(), fast)?;
-        if entities.is_empty() {
-            if let Some(context) = context {
-                return self.entity.extract(context.as_str(), fast);
-            }
+        if entities.is_empty()
+            && let Some(context) = context
+        {
+            return self.entity.extract(context.as_str(), fast);
         }
         Ok(entities)
     }

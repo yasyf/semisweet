@@ -107,13 +107,13 @@ impl VectorStorageBackend for TurbopufferVectorStore {
     fn upsert(&self, ns: &Namespace, entry: VectorEntry) -> Result<()> {
         let dim = entry.vector.dim();
         let cached = self.cached_dim(ns)?;
-        if let Some(existing) = cached {
-            if existing != dim {
-                return Err(Error::DimMismatch {
-                    got: dim.get(),
-                    want: existing.get(),
-                });
-            }
+        if let Some(existing) = cached
+            && existing != dim
+        {
+            return Err(Error::DimMismatch {
+                got: dim.get(),
+                want: existing.get(),
+            });
         }
 
         let date = entry
