@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::paths;
 use crate::protocol::PROTOCOL_VERSION;
 
@@ -103,6 +103,15 @@ pub(crate) fn spawn_daemon(launcher: &Launcher) -> Result<()> {
     let mut child = command.spawn()?;
     // Reap the launcher. It forks the orphan daemon and exits immediately; the
     // orphan is reparented to init and outlives both the launcher and this client.
-    child.wait()?;
+    // A non-zero status means the launch failed before the fork (bad import, bad
+    // config), so surface it now instead of letting the connect poll mistake it
+    // for a 30s-later shutdown.
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(Error::Daemon(format!(
+            "daemon launcher exited with {status}; see log at {}",
+            log.display()
+        )));
+    }
     Ok(())
 }

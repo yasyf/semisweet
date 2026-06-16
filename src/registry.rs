@@ -142,6 +142,24 @@ impl ScoringDto {
                 self.floor_threshold, self.base_threshold
             )));
         }
+        if !(0.0..=1.0).contains(&self.base_threshold) {
+            return Err(Error::InvalidConfig(format!(
+                "base_threshold {} must be finite and within 0.0..=1.0",
+                self.base_threshold
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.floor_threshold) {
+            return Err(Error::InvalidConfig(format!(
+                "floor_threshold {} must be finite and within 0.0..=1.0",
+                self.floor_threshold
+            )));
+        }
+        if !self.entity_bonus_weight.is_finite() || self.entity_bonus_weight < 0.0 {
+            return Err(Error::InvalidConfig(format!(
+                "entity_bonus_weight {} must be finite and >= 0.0",
+                self.entity_bonus_weight
+            )));
+        }
         let top_k = NonZeroUsize::new(self.top_k)
             .ok_or_else(|| Error::InvalidConfig("top_k must be greater than zero".to_owned()))?;
         let context = match self.context.as_str() {
@@ -420,6 +438,50 @@ mod tests {
             "offline build_cache should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn scoring_default_converts_to_config() {
+        assert!(ScoringDto::default().to_config().is_ok());
+    }
+
+    #[test]
+    fn scoring_rejects_nan_and_out_of_range() {
+        let nan_base = ScoringDto {
+            base_threshold: f32::NAN,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            nan_base.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let nan_floor = ScoringDto {
+            floor_threshold: f32::NAN,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            nan_floor.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let base_over_one = ScoringDto {
+            base_threshold: 1.5,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            base_over_one.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let negative_weight = ScoringDto {
+            entity_bonus_weight: -0.1,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            negative_weight.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 
     #[test]

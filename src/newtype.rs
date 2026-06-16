@@ -15,10 +15,21 @@ pub struct Namespace(String);
 
 impl Namespace {
     pub fn new(value: String) -> Result<Self> {
-        if value.trim().is_empty() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
             return Err(Error::EmptyNamespace);
         }
-        Ok(Self(value))
+        if trimmed.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidNamespace(format!(
+                "namespace `{trimmed}` must be a single safe path segment"
+            )));
+        }
+        if trimmed == "." || trimmed == ".." {
+            return Err(Error::InvalidNamespace(format!(
+                "namespace `{trimmed}` must not be a path traversal component"
+            )));
+        }
+        Ok(Self(trimmed.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -37,10 +48,11 @@ pub struct Key(String);
 
 impl Key {
     pub fn new(value: String) -> Result<Self> {
-        if value.trim().is_empty() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
             return Err(Error::EmptyKey);
         }
-        Ok(Self(value))
+        Ok(Self(trimmed.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -96,7 +108,7 @@ impl Context {
     pub fn new(value: String) -> Result<Self> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            return Err(Error::EmptyQuery);
+            return Err(Error::EmptyContext);
         }
         Ok(Self(trimmed.to_owned()))
     }
@@ -130,7 +142,13 @@ pub struct Embedding {
 impl Embedding {
     pub fn new(mut values: Vec<f32>) -> Result<Self> {
         let dim = Dim::new(values.len())?;
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(Error::NonFiniteEmbedding);
+        }
         let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if !norm.is_finite() {
+            return Err(Error::NonFiniteEmbedding);
+        }
         if norm == 0.0 {
             return Err(Error::ZeroEmbedding);
         }
@@ -210,9 +228,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn namespace_rejects_blank() {
-        assert!(Namespace::new("   ".to_owned()).is_err());
-        assert!(Namespace::new(String::new()).is_err());
+    fn namespace_rejects_blank_and_unsafe_segments() {
+        assert!(matches!(
+            Namespace::new("   ".to_owned()),
+            Err(Error::EmptyNamespace)
+        ));
+        assert!(matches!(
+            Namespace::new(String::new()),
+            Err(Error::EmptyNamespace)
+        ));
+        assert!(matches!(
+            Namespace::new("a/b".to_owned()),
+            Err(Error::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            Namespace::new("../etc".to_owned()),
+            Err(Error::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            Namespace::new("a\u{0}b".to_owned()),
+            Err(Error::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            Namespace::new("..".to_owned()),
+            Err(Error::InvalidNamespace(_))
+        ));
         assert_eq!(Namespace::new("prod".to_owned()).unwrap().as_str(), "prod");
     }
 
@@ -234,11 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn embedding_rejects_empty_and_zero() {
+    fn embedding_rejects_empty_zero_and_non_finite() {
         assert!(matches!(Embedding::new(vec![]), Err(Error::EmptyEmbedding)));
         assert!(matches!(
             Embedding::new(vec![0.0, 0.0]),
             Err(Error::ZeroEmbedding)
+        ));
+        assert!(matches!(
+            Embedding::new(vec![f32::NAN, 1.0]),
+            Err(Error::NonFiniteEmbedding)
+        ));
+        assert!(matches!(
+            Embedding::new(vec![f32::INFINITY, 0.0]),
+            Err(Error::NonFiniteEmbedding)
         ));
     }
 

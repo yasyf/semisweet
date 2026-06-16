@@ -6,11 +6,31 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use super::state::PendingWrites;
 use crate::newtype::{Context, EntryId, Key, QueryText};
 use crate::registry::DynCache;
+
+/// Decrements the in-flight count on drop, so a job that panics mid-run still releases
+/// its slot and `is_drained` can converge.
+struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl InFlightGuard {
+    fn enter(in_flight: Arc<AtomicUsize>) -> Self {
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        Self { in_flight }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub(super) struct WriteJob {
     pub(super) cache: Arc<DynCache>,
@@ -66,15 +86,19 @@ pub(super) struct WriteQueue {
     // life, so `try_push` reports real backpressure (a full queue) rather than a
     // disconnect even if every worker thread has exited.
     _keep_alive: crossbeam_channel::Receiver<WriteJob>,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl WriteQueue {
     pub(super) fn new(capacity: usize, workers: usize) -> Self {
         let (sender, receiver) = crossbeam_channel::bounded::<WriteJob>(capacity);
+        let in_flight = Arc::new(AtomicUsize::new(0));
         for _ in 0..workers {
             let receiver = receiver.clone();
+            let in_flight = in_flight.clone();
             thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
+                    let _guard = InFlightGuard::enter(in_flight.clone());
                     job.run();
                 }
             });
@@ -82,12 +106,18 @@ impl WriteQueue {
         Self {
             sender,
             _keep_alive: receiver,
+            in_flight,
         }
     }
 
     /// Enqueues a write, returning `false` if the bounded queue is full.
     pub(super) fn try_push(&self, job: WriteJob) -> bool {
         self.sender.try_send(job).is_ok()
+    }
+
+    /// Whether the queue has nothing left to do: no jobs waiting and none mid-run.
+    pub(super) fn is_drained(&self) -> bool {
+        self.sender.is_empty() && self.in_flight.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -114,10 +144,6 @@ mod tests {
         }
 
         fn embed_query(&self, _text: &str) -> Result<Embedding> {
-            Embedding::new(vec![1.0, 0.0])
-        }
-
-        fn embed_document(&self, _text: &str) -> Result<Embedding> {
             Embedding::new(vec![1.0, 0.0])
         }
     }
@@ -160,6 +186,19 @@ mod tests {
             context: None,
             value: Arc::from(vec![1u8, 2, 3]),
         }
+    }
+
+    #[test]
+    fn is_drained_reflects_queued_jobs() {
+        let cache = stub_cache();
+        // No drain workers: a pushed job stays queued and never runs.
+        let queue = WriteQueue::new(2, 0);
+        assert!(queue.is_drained(), "an empty queue is drained");
+        assert!(queue.try_push(job(&cache)), "push fits");
+        assert!(
+            !queue.is_drained(),
+            "a queued job means the queue is not drained"
+        );
     }
 
     #[test]

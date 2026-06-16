@@ -1,7 +1,7 @@
 //! The orphan daemon: a lazily-started, single-instance, per-user process that
 //! survives its spawner, tracks clients, and idle-shuts-down.
 //!
-//! `run_daemon` is the process entry point. It double-forks into an orphan,
+//! `run_daemon` is the process entry point. It forks once into an orphan,
 //! claims the single-instance lock, and runs the async supervisor.
 
 mod conn;

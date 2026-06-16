@@ -23,14 +23,22 @@ impl InferencePool {
             let receiver = receiver.clone();
             thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    job();
+                    // A panicking job drops its oneshot `tx`, so the awaiting handler
+                    // already unblocks with `Err(DaemonShutdown)`; catching here keeps the
+                    // worker thread alive so one bad job can't permanently kill it.
+                    if let Err(panic) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    {
+                        eprintln!("semisweet-daemon: inference job panicked: {panic:?}");
+                        continue;
+                    }
                 }
             });
         }
         Self { sender }
     }
 
-    pub(super) async fn run<F, R>(&self, work: F) -> R
+    pub(super) async fn run<F, R>(&self, work: F) -> crate::error::Result<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -41,13 +49,13 @@ impl InferencePool {
         });
         match self.sender.send(job) {
             Ok(()) => match rx.await {
-                Ok(value) => value,
-                // The worker dropped the result channel without sending: only reachable
-                // once the pool's threads are torn down at daemon shutdown.
-                Err(_) => std::future::pending::<R>().await,
+                Ok(value) => Ok(value),
+                // The worker dropped the result channel without sending (a torn-down pool
+                // at shutdown, or a panicked job): surface it as a clean shutdown error.
+                Err(_) => Err(crate::error::Error::DaemonShutdown),
             },
             // Every worker thread is gone: the daemon is shutting down around us.
-            Err(_) => std::future::pending::<R>().await,
+            Err(_) => Err(crate::error::Error::DaemonShutdown),
         }
     }
 }
@@ -63,7 +71,23 @@ mod tests {
             .build()
             .unwrap();
         let pool = InferencePool::new();
-        let value = runtime.block_on(pool.run(|| 6 * 7));
+        let value = runtime.block_on(pool.run(|| 6 * 7)).unwrap();
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn panicking_job_surfaces_shutdown_and_worker_survives() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = InferencePool::new();
+
+        let panicked = runtime.block_on(pool.run(|| -> i32 { panic!("boom") }));
+        assert!(matches!(panicked, Err(crate::error::Error::DaemonShutdown)));
+
+        // The worker survived the panic, so a subsequent job still completes.
+        let value = runtime.block_on(pool.run(|| 6 * 7)).unwrap();
         assert_eq!(value, 42);
     }
 }

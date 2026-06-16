@@ -10,6 +10,8 @@ use crate::error::{Error, Result};
 use crate::newtype::{EntryId, Namespace};
 use crate::object::ObjectStorageBackend;
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn backend_err<E: std::error::Error + Send + Sync + 'static>(err: E) -> Error {
     Error::ObjectStorage(Box::new(err))
 }
@@ -74,6 +76,9 @@ impl S3ObjectStore {
         if path_style {
             bucket = *bucket.with_path_style();
         }
+        bucket = *bucket
+            .with_request_timeout(REQUEST_TIMEOUT)
+            .map_err(backend_err)?;
 
         Ok(Self { bucket, prefix })
     }

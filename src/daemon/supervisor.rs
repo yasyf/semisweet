@@ -5,6 +5,7 @@
 //! arms; if it fires while still zero the daemon shuts down gracefully.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -15,6 +16,11 @@ use super::Config;
 use super::conn;
 use super::state::DaemonState;
 use crate::error::Result;
+
+/// How long shutdown waits for the write-behind queue to drain before giving up, so a
+/// wedged commit can't hang the daemon's exit forever.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 pub(super) enum ClientEvent {
     Connected,
@@ -64,14 +70,23 @@ pub(super) async fn run(config: &Config) -> Result<()> {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _addr) = accepted?;
-                tokio::spawn(conn::serve(
-                    stream,
-                    events_tx.clone(),
-                    state.clone(),
-                    config.daemon_version.clone(),
-                    config.protocol,
-                ));
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        tokio::spawn(conn::serve(
+                            stream,
+                            events_tx.clone(),
+                            state.clone(),
+                            config.daemon_version.clone(),
+                            config.protocol,
+                        ));
+                    }
+                    // A single failed accept (e.g. fd exhaustion) must not kill the
+                    // daemon; log it and keep serving the connections we already have.
+                    Err(error) => {
+                        eprintln!("semisweet-daemon: accept failed: {error}");
+                        continue;
+                    }
+                }
             }
             Some(event) = events_rx.recv() => {
                 match event {
@@ -83,13 +98,20 @@ pub(super) async fn run(config: &Config) -> Result<()> {
                     }
                 }
             }
-            _ = &mut idle_timer, if clients.is_idle() => {
+            _ = &mut idle_timer, if clients.is_idle() && state.writer.is_drained() => {
                 break;
             }
             _ = sigterm.recv() => {
                 break;
             }
         }
+    }
+    // Both exit paths (idle and SIGTERM) drain the write-behind queue before returning so
+    // accepted-but-not-yet-committed writes still land, bounded so a stuck commit can't
+    // hang shutdown forever.
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while !state.writer.is_drained() && Instant::now() < deadline {
+        sleep(SHUTDOWN_DRAIN_POLL).await;
     }
     Ok(())
 }
