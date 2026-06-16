@@ -15,6 +15,12 @@ name = "semisweet"
 # crate as a normal Rust lib and run unit tests.
 crate-type = ["cdylib", "rlib"]
 
+# A real, spawnable orphan daemon binary. Integration tests drive it via
+# CARGO_BIN_EXE_semisweet-daemon; the production Python entry point lands in Phase 4.
+[[bin]]
+name = "semisweet-daemon"
+path = "src/bin/semisweet-daemon.rs"
+
 [dependencies]
 # No "extension-module" feature: it is deprecated as of pyo3 0.29. maturin
 # (>= 1.9.4) sets PYO3_BUILD_EXTENSION_MODULE at wheel-build time, while a bare
@@ -22,3 +28,76 @@ crate-type = ["cdylib", "rlib"]
 # the single source of truth for cargo and maturin alike, mirrored by
 # requires-python ">=3.9" in pyproject.toml.
 pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v5", "v4"] }
+
+# --- Daemon core (non-optional; the lazily-started orphan daemon is essential) ---
+
+# serde is non-optional: the IPC protocol always derives Serialize/Deserialize.
+# serde_json stays optional (HTTP backends only). postcard is the wire codec.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11"
+# serde_json is non-optional: the namespace registry always parses the JSON config
+# carried in `RegisterNamespace`, independent of which backend features are compiled.
+serde_json = "1.0.150"
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+bytes = "1"
+# MPMC channels for the daemon's dedicated blocking pools (inference + write-behind).
+crossbeam-channel = "0.5"
+nix = { version = "0.31", features = ["process", "user"] }
+fd-lock = "4"
+directories = "6"
+
+# --- Backend deps (all optional; gated by the [features] table below) ---
+
+# Shared by the voyage + turbopuffer HTTP backends. reqwest uses its blocking
+# (sync) client with rustls so no system OpenSSL or async runtime is required.
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
+
+# local-embed: fastembed pins ort =2.0.0-rc.12 and downloads a prebuilt ONNX
+# Runtime at build time (ort-download-binaries-*), so no system libonnxruntime.
+# rustls variants avoid a system OpenSSL dependency for model/binary downloads.
+fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+
+# gliner: kreuzberg-gliner-rs is the fork of gline-rs that pins ort =2.0.0-rc.12,
+# matching fastembed. Upstream gline-rs pins ort =2.0.0-rc.9, which cannot share a
+# lockfile with fastembed. ort's default features include `download-binaries`, so
+# this backend also needs no system libonnxruntime.
+kreuzberg-gliner-rs = { version = "0.2.0", optional = true }
+
+# keyword: pure-Rust YAKE keyword extractor, no model download.
+yake-rust = { version = "1.0.3", optional = true }
+
+# s3: rust-s3's truly-sync path (attohttpc, no tokio) with rustls TLS. The library
+# is imported as `s3` (crate name `rust-s3`).
+rust-s3 = { version = "0.37.2", default-features = false, features = ["sync-rustls-tls"], optional = true }
+
+[dev-dependencies]
+# HTTP mock server for the voyage + turbopuffer backend tests. httpmock runs a real
+# blocking server, so it pairs with reqwest's blocking client (wiremock is async-only).
+httpmock = "0.8.3"
+# Temp dirs for the object_disk backend tests.
+tempfile = "3.27.0"
+# The daemon-serving integration test builds the JSON config and the byte-valued
+# Set request the daemon's public protocol carries.
+serde_json = "1.0.150"
+serde_bytes = "0.11"
+# Real MinIO container for the object_s3 integration test; the `blocking` feature
+# exposes a sync container runner to match the sync s3 client.
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["minio", "blocking"] }
+
+[features]
+# Pure-Rust + HTTP backends are on by default; vector_memory and object_disk always
+# compile (std only, no feature gate); the ONNX backends are opt-in.
+default = ["voyage", "turbopuffer", "keyword", "s3"]
+onnx = []
+voyage = ["dep:reqwest"]
+turbopuffer = ["dep:reqwest"]
+keyword = ["dep:yake-rust"]
+s3 = ["dep:rust-s3"]
+local-embed = ["onnx", "dep:fastembed"]
+gliner = ["onnx", "dep:kreuzberg-gliner-rs"]
