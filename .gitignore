@@ -1,0 +1,23 @@
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local environment
+.env*
+
+# Claude Code
+.context/
+.claude/settings.local.json
+
+# Python bytecode (guard hooks are Python even in non-Python repos)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Rust
+/target
+# Cargo.lock is intentionally committed (this crate ships a wheel; reproducible
+# builds) — do not ignore it.
