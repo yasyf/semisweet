@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -107,7 +107,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -156,7 +156,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -182,7 +182,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
@@ -212,7 +212,7 @@ jobs:
         with:
           python-version: "3.13"
           activate-environment: true
-          enable-cache: true
+          enable-cache: false
 
       - uses: Swatinem/rust-cache@v2
 
