@@ -1,8 +1,8 @@
 //! The seam between the Phase 2 backends and the daemon: a serde config describing
 //! one namespace's backend choices, and `build_cache`, which turns that config into a
-//! ready `DynCache`. Phase 4's Python builder emits the JSON carried in
-//! `RegisterNamespace.config_json`; a backend whose Cargo feature is not compiled is
-//! reported as `UnknownBackend` rather than silently substituted.
+//! ready `DynCache`. The pyo3 binding layer serializes a `NamespaceConfig` into the JSON
+//! carried in `RegisterNamespace.config_json`; a backend whose Cargo feature is not compiled
+//! is reported as `UnknownBackend` rather than silently substituted.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -18,6 +18,9 @@ use crate::newtype::Namespace;
 use crate::object::ObjectStorageBackend;
 use crate::scoring::{ContextMode, ScoringConfig};
 use crate::vector::VectorStorageBackend;
+
+const DEFAULT_VOYAGE_MODEL: &str = "voyage-3.5-lite";
+const DEFAULT_VOYAGE_DIM: usize = 512;
 
 pub type DynCache = Cache<
     Arc<dyn EntityBackend>,
@@ -40,9 +43,17 @@ pub struct NamespaceConfig {
 #[serde(tag = "kind")]
 pub enum EmbeddingChoice {
     #[serde(rename = "voyage")]
-    Voyage { model: String, dim: usize },
+    Voyage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dim: Option<usize>,
+    },
     #[serde(rename = "local")]
-    Local,
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,7 +62,19 @@ pub enum EntityChoice {
     #[serde(rename = "keyword")]
     Keyword { language: Option<String> },
     #[serde(rename = "gliner")]
-    Gliner { labels: Vec<String> },
+    Gliner {
+        labels: Vec<String>,
+        /// HuggingFace Hub repo to auto-download the ONNX model + tokenizer from
+        /// when explicit paths are not given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        /// Explicit path to the GLiNER ONNX model, bypassing auto-download.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Explicit path to the GLiNER tokenizer.json, bypassing auto-download.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokenizer: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,8 +93,11 @@ pub enum ObjectChoice {
     Disk { root: Option<String> },
     #[serde(rename = "s3")]
     S3 {
-        bucket: String,
-        region: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bucket: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint: Option<String>,
         prefix: String,
     },
@@ -153,7 +179,12 @@ pub fn build_cache(namespace: &str, config: &NamespaceConfig) -> Result<DynCache
 fn build_entity(choice: &EntityChoice) -> Result<Arc<dyn EntityBackend>> {
     match choice {
         EntityChoice::Keyword { language } => build_keyword(language.as_deref()),
-        EntityChoice::Gliner { labels } => build_gliner(labels),
+        EntityChoice::Gliner {
+            labels,
+            repo,
+            model,
+            tokenizer,
+        } => build_gliner(labels, repo.clone(), model.clone(), tokenizer.clone()),
     }
 }
 
@@ -173,47 +204,58 @@ fn build_keyword(_language: Option<&str>) -> Result<Arc<dyn EntityBackend>> {
 }
 
 #[cfg(feature = "gliner")]
-fn build_gliner(labels: &[String]) -> Result<Arc<dyn EntityBackend>> {
+fn build_gliner(
+    labels: &[String],
+    repo: Option<String>,
+    model: Option<String>,
+    tokenizer: Option<String>,
+) -> Result<Arc<dyn EntityBackend>> {
     use crate::backends::entity_gliner::GlinerEntities;
-    let backend = GlinerEntities::new(labels.to_vec())?;
+    let backend = GlinerEntities::new(labels.to_vec(), repo, model, tokenizer)?;
     Ok(Arc::new(backend))
 }
 
 #[cfg(not(feature = "gliner"))]
-fn build_gliner(_labels: &[String]) -> Result<Arc<dyn EntityBackend>> {
+fn build_gliner(
+    _labels: &[String],
+    _repo: Option<String>,
+    _model: Option<String>,
+    _tokenizer: Option<String>,
+) -> Result<Arc<dyn EntityBackend>> {
     Err(Error::UnknownBackend("gliner".to_owned()))
 }
 
 fn build_embedding(choice: &EmbeddingChoice) -> Result<Arc<dyn EmbeddingBackend>> {
     match choice {
-        EmbeddingChoice::Voyage { model, dim } => build_voyage(model, *dim),
-        EmbeddingChoice::Local => build_local(),
+        EmbeddingChoice::Voyage { model, dim } => build_voyage(model.clone(), *dim),
+        EmbeddingChoice::Local { model } => build_local(model.as_deref()),
     }
 }
 
 #[cfg(feature = "voyage")]
-fn build_voyage(model: &str, dim: usize) -> Result<Arc<dyn EmbeddingBackend>> {
+fn build_voyage(model: Option<String>, dim: Option<usize>) -> Result<Arc<dyn EmbeddingBackend>> {
     use crate::backends::embed_voyage::VoyageEmbedding;
-    let dim = NonZeroUsize::new(dim).ok_or_else(|| {
+    let model = model.unwrap_or_else(|| DEFAULT_VOYAGE_MODEL.to_owned());
+    let dim = NonZeroUsize::new(dim.unwrap_or(DEFAULT_VOYAGE_DIM)).ok_or_else(|| {
         Error::InvalidConfig("embedding dim must be greater than zero".to_owned())
     })?;
-    let backend = VoyageEmbedding::new(model.to_owned(), dim)?;
+    let backend = VoyageEmbedding::new(model, dim)?;
     Ok(Arc::new(backend))
 }
 
 #[cfg(not(feature = "voyage"))]
-fn build_voyage(_model: &str, _dim: usize) -> Result<Arc<dyn EmbeddingBackend>> {
+fn build_voyage(_model: Option<String>, _dim: Option<usize>) -> Result<Arc<dyn EmbeddingBackend>> {
     Err(Error::UnknownBackend("voyage".to_owned()))
 }
 
 #[cfg(feature = "local-embed")]
-fn build_local() -> Result<Arc<dyn EmbeddingBackend>> {
+fn build_local(model: Option<&str>) -> Result<Arc<dyn EmbeddingBackend>> {
     use crate::backends::embed_local::LocalEmbedding;
-    Ok(Arc::new(LocalEmbedding::new()?))
+    Ok(Arc::new(LocalEmbedding::new(model)?))
 }
 
 #[cfg(not(feature = "local-embed"))]
-fn build_local() -> Result<Arc<dyn EmbeddingBackend>> {
+fn build_local(_model: Option<&str>) -> Result<Arc<dyn EmbeddingBackend>> {
     Err(Error::UnknownBackend("local".to_owned()))
 }
 
@@ -253,31 +295,26 @@ fn build_object(choice: &ObjectChoice) -> Result<Arc<dyn ObjectStorageBackend>> 
             region,
             endpoint,
             prefix,
-        } => build_s3(bucket, region, endpoint.clone(), prefix),
+        } => build_s3(bucket.clone(), region.clone(), endpoint.clone(), prefix),
     }
 }
 
 #[cfg(feature = "s3")]
 fn build_s3(
-    bucket: &str,
-    region: &str,
+    bucket: Option<String>,
+    region: Option<String>,
     endpoint: Option<String>,
     prefix: &str,
 ) -> Result<Arc<dyn ObjectStorageBackend>> {
     use crate::backends::object_s3::S3ObjectStore;
-    let store = S3ObjectStore::new(
-        bucket.to_owned(),
-        region.to_owned(),
-        endpoint,
-        prefix.to_owned(),
-    )?;
+    let store = S3ObjectStore::new(bucket, region, endpoint, prefix.to_owned())?;
     Ok(Arc::new(store))
 }
 
 #[cfg(not(feature = "s3"))]
 fn build_s3(
-    _bucket: &str,
-    _region: &str,
+    _bucket: Option<String>,
+    _region: Option<String>,
     _endpoint: Option<String>,
     _prefix: &str,
 ) -> Result<Arc<dyn ObjectStorageBackend>> {
@@ -291,8 +328,8 @@ mod tests {
     fn offline_config(root: &str) -> NamespaceConfig {
         NamespaceConfig {
             embedding: EmbeddingChoice::Voyage {
-                model: "voyage-3.5-lite".to_owned(),
-                dim: 512,
+                model: Some("voyage-3.5-lite".to_owned()),
+                dim: Some(512),
             },
             entity: EntityChoice::Keyword { language: None },
             vector: VectorChoice::Memory,
@@ -307,16 +344,19 @@ mod tests {
     fn namespace_config_round_trips_through_json() {
         let config = NamespaceConfig {
             embedding: EmbeddingChoice::Voyage {
-                model: "voyage-3".to_owned(),
-                dim: 1024,
+                model: Some("voyage-3".to_owned()),
+                dim: Some(1024),
             },
             entity: EntityChoice::Gliner {
                 labels: vec!["drug".to_owned(), "dose".to_owned()],
+                repo: None,
+                model: None,
+                tokenizer: None,
             },
             vector: VectorChoice::Turbopuffer,
             object: ObjectChoice::S3 {
-                bucket: "cache".to_owned(),
-                region: "us-east-1".to_owned(),
+                bucket: Some("cache".to_owned()),
+                region: Some("us-east-1".to_owned()),
                 endpoint: None,
                 prefix: "ns/".to_owned(),
             },
@@ -342,7 +382,7 @@ mod tests {
     #[test]
     fn choice_tags_are_stable() {
         assert_eq!(
-            serde_json::to_string(&EmbeddingChoice::Local).unwrap(),
+            serde_json::to_string(&EmbeddingChoice::Local { model: None }).unwrap(),
             r#"{"kind":"local"}"#
         );
         assert_eq!(
@@ -350,14 +390,14 @@ mod tests {
             r#"{"kind":"turbopuffer"}"#
         );
         let s3 = ObjectChoice::S3 {
-            bucket: "b".to_owned(),
-            region: "r".to_owned(),
+            bucket: Some("b".to_owned()),
+            region: Some("r".to_owned()),
             endpoint: None,
             prefix: "p".to_owned(),
         };
         assert_eq!(
             serde_json::to_string(&s3).unwrap(),
-            r#"{"kind":"s3","bucket":"b","region":"r","endpoint":null,"prefix":"p"}"#
+            r#"{"kind":"s3","bucket":"b","region":"r","prefix":"p"}"#
         );
     }
 
@@ -393,15 +433,18 @@ mod tests {
         ));
     }
 
-    // Only meaningful when `gliner` is compiled OUT: with the feature on,
-    // build_cache constructs the backend and fails later (missing model env)
-    // rather than reporting an unknown backend.
+    // Only meaningful when `gliner` is compiled OUT: with the feature on, build_cache
+    // constructs the backend (attempting a Hugging Face Hub download) rather than
+    // reporting an unknown backend.
     #[cfg(not(feature = "gliner"))]
     #[test]
     fn build_cache_rejects_feature_off_backend() {
         let mut config = offline_config("/tmp/unused");
         config.entity = EntityChoice::Gliner {
             labels: vec!["drug".to_owned()],
+            repo: None,
+            model: None,
+            tokenizer: None,
         };
         assert!(matches!(
             build_cache("clinical", &config),

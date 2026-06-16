@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use crate::error::Result;
 use crate::newtype::{Context, Embedding, Entity, EntryId, Key, Namespace};
@@ -28,7 +27,6 @@ pub struct VectorEntry {
     pub keys: BTreeSet<Key>,
     pub entities: BTreeSet<Entity>,
     pub context: Option<Context>,
-    pub date: SystemTime,
 }
 
 #[derive(Debug, Clone)]

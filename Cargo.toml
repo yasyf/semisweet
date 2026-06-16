@@ -57,16 +57,21 @@ directories = "6"
 # (sync) client with rustls so no system OpenSSL or async runtime is required.
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 
-# local-embed: fastembed pins ort =2.0.0-rc.12 and downloads a prebuilt ONNX
-# Runtime at build time (ort-download-binaries-*), so no system libonnxruntime.
-# rustls variants avoid a system OpenSSL dependency for model/binary downloads.
-fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"], optional = true }
+# local-embed: fastembed 4.9.x pins ort =2.0.0-rc.9 (matching upstream gline-rs, so
+# both ONNX backends share one ort build) and downloads a prebuilt ONNX Runtime at
+# build time (ort-download-binaries), so no system libonnxruntime. hf-hub-rustls-tls
+# avoids a system OpenSSL dependency for the BGE model download.
+fastembed = { version = "4.9.1", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries"], optional = true }
 
-# gliner: kreuzberg-gliner-rs is the fork of gline-rs that pins ort =2.0.0-rc.12,
-# matching fastembed. Upstream gline-rs pins ort =2.0.0-rc.9, which cannot share a
-# lockfile with fastembed. ort's default features include `download-binaries`, so
-# this backend also needs no system libonnxruntime.
-kreuzberg-gliner-rs = { version = "0.2.0", optional = true }
+# gliner: upstream gline-rs pins ort =2.0.0-rc.9, the same build fastembed 4.9.x
+# resolves, so gliner + local-embed co-compile under --all-features. ort's
+# download-binaries feature means this backend needs no system libonnxruntime.
+gline-rs = { version = "1.0.1", optional = true }
+
+# hf-hub (sync/ureq) downloads the GLiNER ONNX model + tokenizer from the Hub at
+# construction time, mirroring fastembed's BGE auto-download. ureq carries rustls by
+# default, so no system OpenSSL.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 
 # keyword: pure-Rust YAKE keyword extractor, no model download.
 yake-rust = { version = "1.0.3", optional = true }
@@ -91,13 +96,15 @@ testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["minio", "blocking"] }
 
 [features]
-# Pure-Rust + HTTP backends are on by default; vector_memory and object_disk always
-# compile (std only, no feature gate); the ONNX backends are opt-in.
-default = ["voyage", "turbopuffer", "keyword", "s3"]
+# Batteries-included by default: the zero-config `SemanticCache(namespace=...)` runs
+# fully offline on local BGE embeddings + YAKE keywords + the in-memory vector index
+# + on-disk objects. vector_memory and object_disk always compile (std only, no
+# feature gate); gliner stays opt-in (extra crate + model download).
+default = ["local-embed", "voyage", "turbopuffer", "keyword", "s3"]
 onnx = []
 voyage = ["dep:reqwest"]
 turbopuffer = ["dep:reqwest"]
 keyword = ["dep:yake-rust"]
 s3 = ["dep:rust-s3"]
 local-embed = ["onnx", "dep:fastembed"]
-gliner = ["onnx", "dep:kreuzberg-gliner-rs"]
+gliner = ["onnx", "dep:gline-rs", "dep:hf-hub"]

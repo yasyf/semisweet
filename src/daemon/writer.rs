@@ -8,23 +8,53 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::thread;
 
-use crate::newtype::{Context, Key, QueryText};
+use super::state::PendingWrites;
+use crate::newtype::{Context, EntryId, Key, QueryText};
 use crate::registry::DynCache;
 
 pub(super) struct WriteJob {
     pub(super) cache: Arc<DynCache>,
+    pub(super) pending: Arc<PendingWrites>,
+    pub(super) id: EntryId,
     pub(super) query: QueryText,
     pub(super) keys: BTreeSet<Key>,
     pub(super) context: Option<Context>,
-    pub(super) value: Vec<u8>,
+    pub(super) value: Arc<[u8]>,
 }
 
 impl WriteJob {
     fn run(self) {
-        if let Err(error) = self
-            .cache
-            .set(&self.query, &self.keys, &self.context, &self.value)
-        {
+        // Run the slow half (entity extract + embed) first, off the pending lock.
+        let entry = match self.cache.prepare(&self.query, &self.keys, &self.context) {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("semisweet-daemon: write failed: {error}");
+                return;
+            }
+        };
+        // Embedding done; only now decide whether to commit. Commit only if the shadow
+        // still holds exactly this value: a `delete` that landed during the (long) embed
+        // cleared it, or a newer `set` replaced it — either way this stale job skips, with
+        // no lost update and no resurrected delete. Doing the embed before this check is
+        // what shrinks the resurrect-on-delete window from the whole embed to just the
+        // upsert below.
+        match self.pending.holds(&self.id, &self.value) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                eprintln!("semisweet-daemon: pending check failed: {error}");
+                return;
+            }
+        }
+        let result = self.cache.commit(&entry, &self.value);
+        // Drop the shadow once the entry is durable (or the write failed), but only if it
+        // still holds OUR value — a set that raced in during the commit keeps its own
+        // shadow for its own job. Done after `commit` so a concurrent `get` never sees a
+        // gap where the entry is in neither the buffer nor the stores.
+        if let Err(error) = self.pending.remove_if(&self.id, &self.value) {
+            eprintln!("semisweet-daemon: pending cleanup failed: {error}");
+        }
+        if let Err(error) = result {
             eprintln!("semisweet-daemon: write failed: {error}");
         }
     }
@@ -118,12 +148,17 @@ mod tests {
     }
 
     fn job(cache: &Arc<DynCache>) -> WriteJob {
+        let query = QueryText::new("q".to_owned()).unwrap();
+        let keys = BTreeSet::new();
+        let id = EntryId::derive(&query, &keys);
         WriteJob {
             cache: cache.clone(),
-            query: QueryText::new("q".to_owned()).unwrap(),
-            keys: BTreeSet::new(),
+            pending: Arc::new(PendingWrites::default()),
+            id,
+            query,
+            keys,
             context: None,
-            value: vec![1, 2, 3],
+            value: Arc::from(vec![1u8, 2, 3]),
         }
     }
 
@@ -135,5 +170,88 @@ mod tests {
         assert!(queue.try_push(job(&cache)), "first push fits");
         assert!(queue.try_push(job(&cache)), "second push fills the queue");
         assert!(!queue.try_push(job(&cache)), "third push hits the bound");
+    }
+
+    #[test]
+    fn drained_job_clears_its_pending_shadow() {
+        let cache = stub_cache();
+        let pending = Arc::new(PendingWrites::default());
+        let query = QueryText::new("q".to_owned()).unwrap();
+        let keys = BTreeSet::new();
+        let id = EntryId::derive(&query, &keys);
+        let value: Arc<[u8]> = Arc::from(vec![9u8, 8, 7]);
+        pending.insert(id, value.clone()).unwrap();
+
+        let job = WriteJob {
+            cache,
+            pending: pending.clone(),
+            id,
+            query,
+            keys,
+            context: None,
+            value,
+        };
+        job.run();
+
+        assert!(
+            pending.get(&id).unwrap().is_none(),
+            "a successful write must drop its read-after-write shadow"
+        );
+    }
+
+    #[test]
+    fn deleted_entry_is_not_resurrected() {
+        let cache = stub_cache();
+        // Empty pending: a delete removed the shadow before this queued job ran.
+        let pending = Arc::new(PendingWrites::default());
+        let query = QueryText::new("q".to_owned()).unwrap();
+        let keys = BTreeSet::new();
+        let id = EntryId::derive(&query, &keys);
+
+        let job = WriteJob {
+            cache: cache.clone(),
+            pending,
+            id,
+            query: query.clone(),
+            keys: keys.clone(),
+            context: None,
+            value: Arc::from(vec![1u8]),
+        };
+        job.run();
+
+        let context: Option<Context> = None;
+        assert!(
+            cache.get(&query, &keys, &context).unwrap().is_none(),
+            "a job whose shadow was deleted must not commit to the store"
+        );
+    }
+
+    #[test]
+    fn superseded_write_is_skipped_and_keeps_the_newer_shadow() {
+        let cache = stub_cache();
+        let pending = Arc::new(PendingWrites::default());
+        let query = QueryText::new("q".to_owned()).unwrap();
+        let keys = BTreeSet::new();
+        let id = EntryId::derive(&query, &keys);
+        let v1: Arc<[u8]> = Arc::from(vec![1u8]);
+        let v2: Arc<[u8]> = Arc::from(vec![2u8]);
+
+        // A newer set (v2) replaced v1 in the shadow before v1's job ran.
+        pending.insert(id, v2.clone()).unwrap();
+        let stale = WriteJob {
+            cache: cache.clone(),
+            pending: pending.clone(),
+            id,
+            query: query.clone(),
+            keys: keys.clone(),
+            context: None,
+            value: v1,
+        };
+        stale.run();
+
+        // v1's job committed nothing and left v2's shadow intact for v2's own job.
+        let context: Option<Context> = None;
+        assert!(cache.get(&query, &keys, &context).unwrap().is_none());
+        assert_eq!(pending.get(&id).unwrap().as_deref(), Some(&[2u8][..]));
     }
 }

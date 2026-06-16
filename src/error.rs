@@ -29,8 +29,6 @@ pub enum Error {
     UnknownBackend(String),
     #[error("invalid namespace config: {0}")]
     InvalidConfig(String),
-    #[error("builder is missing required field `{0}`")]
-    IncompleteBuilder(&'static str),
     #[error("no namespace `{0}`")]
     NamespaceMissing(String),
     #[error("entity extraction failed")]
@@ -65,8 +63,7 @@ impl From<Error> for PyErr {
             | Error::DimMismatch { .. }
             | Error::MissingEnv(_)
             | Error::UnknownBackend(_)
-            | Error::InvalidConfig(_)
-            | Error::IncompleteBuilder(_) => PyValueError::new_err(err.to_string()),
+            | Error::InvalidConfig(_) => PyValueError::new_err(err.to_string()),
             Error::ProtocolVersionMismatch { .. } => PyValueError::new_err(err.to_string()),
             Error::NamespaceMissing(_) => PyKeyError::new_err(err.to_string()),
             Error::EntityExtraction(_)

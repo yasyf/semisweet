@@ -1,27 +1,32 @@
-//! GLiNER zero-shot NER `EntityBackend`, on `kreuzberg-gliner-rs` span mode.
+//! GLiNER zero-shot NER `EntityBackend`, on upstream `gline-rs` span mode.
 //!
 //! A single inference runs at [`FULL_THRESHOLD`]; both the `fast` and full
 //! results are then derived by filtering that one span list at a higher or
 //! lower cutoff, so `extract(t, fast = true)` is a subset of `extract(t, false)`
 //! by construction.
 //!
-//! Model file locations are read from the [`TOKENIZER_ENV`] and [`MODEL_ENV`]
-//! environment variables at construction time, so a missing model fails loudly
-//! at startup rather than on first extraction.
+//! The ONNX model + tokenizer are fetched from the Hugging Face Hub on first
+//! construction — mirroring fastembed's BGE download — and cached on disk. Explicit
+//! `model`/`tokenizer` paths bypass the download.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use gliner::model::GLiNER;
 use gliner::model::input::text::TextInput;
 use gliner::model::params::Parameters;
 use gliner::model::pipeline::span::SpanMode;
+use hf_hub::api::sync::ApiBuilder;
 
 use crate::entity::EntityBackend;
 use crate::error::{Error, Result};
 use crate::newtype::Entity;
 
-const TOKENIZER_ENV: &str = "SEMISWEET_GLINER_TOKENIZER";
-const MODEL_ENV: &str = "SEMISWEET_GLINER_MODEL";
+const DEFAULT_REPO: &str = "onnx-community/gliner_small-v2.1";
+const MODEL_FILE: &str = "onnx/model.onnx";
+const TOKENIZER_FILE: &str = "tokenizer.json";
+// Shared with fastembed's BGE cache so a single env var pins all local model files.
+const MODEL_CACHE_ENV: &str = "SEMISWEET_MODEL_CACHE";
 
 const FULL_THRESHOLD: f32 = 0.50;
 const FAST_CUTOFF: f32 = 0.85;
@@ -34,16 +39,40 @@ fn entities_from_spans(spans: &[(String, f32)], cutoff: f32) -> BTreeSet<Entity>
         .collect()
 }
 
+fn download(repo: &str, file: &str) -> Result<PathBuf> {
+    let mut builder = ApiBuilder::new();
+    if let Some(cache_dir) = std::env::var_os(MODEL_CACHE_ENV) {
+        builder = builder.with_cache_dir(PathBuf::from(cache_dir));
+    }
+    let api = builder
+        .build()
+        .map_err(|e| Error::EntityExtraction(Box::new(e)))?;
+    api.model(repo.to_owned())
+        .get(file)
+        .map_err(|e| Error::EntityExtraction(Box::new(e)))
+}
+
 pub struct GlinerEntities {
     model: GLiNER<SpanMode>,
     labels: Vec<String>,
 }
 
 impl GlinerEntities {
-    pub fn new(labels: Vec<String>) -> Result<Self> {
-        let tokenizer_path =
-            std::env::var(TOKENIZER_ENV).map_err(|_| Error::MissingEnv(TOKENIZER_ENV))?;
-        let model_path = std::env::var(MODEL_ENV).map_err(|_| Error::MissingEnv(MODEL_ENV))?;
+    pub fn new(
+        labels: Vec<String>,
+        repo: Option<String>,
+        model: Option<String>,
+        tokenizer: Option<String>,
+    ) -> Result<Self> {
+        let repo = repo.unwrap_or_else(|| DEFAULT_REPO.to_owned());
+        let tokenizer_path = match tokenizer {
+            Some(path) => PathBuf::from(path),
+            None => download(&repo, TOKENIZER_FILE)?,
+        };
+        let model_path = match model {
+            Some(path) => PathBuf::from(path),
+            None => download(&repo, MODEL_FILE)?,
+        };
         let params = Parameters::default().with_threshold(FULL_THRESHOLD);
         let model = GLiNER::<SpanMode>::new(params, Default::default(), tokenizer_path, model_path)
             .map_err(Error::EntityExtraction)?;
@@ -131,7 +160,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        let backend = GlinerEntities::new(labels).unwrap();
+        let backend = GlinerEntities::new(labels, None, None, None).unwrap();
         let text = "Barack Obama was born in Hawaii and later worked with Microsoft.";
 
         let full = backend.extract(text, false).unwrap();

@@ -42,8 +42,16 @@ pub use vector::{Filter, ScoredHit, VectorEntry, VectorStorageBackend};
 #[pymodule]
 fn semisweet(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::PyCacheQuery>()?;
-    m.add_class::<python::SemanticCacheBuilder>()?;
     m.add_class::<python::PySemanticCache>()?;
+    m.add_class::<python::PyLocalEmbedding>()?;
+    m.add_class::<python::PyVoyageEmbedding>()?;
+    m.add_class::<python::PyKeywordEntities>()?;
+    m.add_class::<python::PyGlinerEntities>()?;
+    m.add_class::<python::PyMemoryVectors>()?;
+    m.add_class::<python::PyTurbopufferVectors>()?;
+    m.add_class::<python::PyDiskStorage>()?;
+    m.add_class::<python::PyS3Storage>()?;
+    m.add_class::<python::PyScoring>()?;
     m.add_function(pyo3::wrap_pyfunction!(python::_run_daemon, m)?)?;
     Ok(())
 }

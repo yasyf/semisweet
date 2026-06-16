@@ -44,11 +44,19 @@ pub struct S3ObjectStore {
 
 impl S3ObjectStore {
     pub fn new(
-        bucket_name: String,
-        region: String,
+        bucket: Option<String>,
+        region: Option<String>,
         endpoint: Option<String>,
         prefix: String,
     ) -> Result<Self> {
+        // bucket/region/endpoint/creds all resolve here, in the one process that owns the
+        // S3 client, so a config is never assembled from two environments.
+        let bucket_name = bucket
+            .or_else(|| std::env::var("SEMISWEET_S3_BUCKET").ok())
+            .ok_or(Error::MissingEnv("SEMISWEET_S3_BUCKET"))?;
+        let region = region
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .ok_or(Error::MissingEnv("AWS_REGION"))?;
         let access_key = std::env::var("AWS_ACCESS_KEY_ID")
             .map_err(|_| Error::MissingEnv("AWS_ACCESS_KEY_ID"))?;
         let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -151,8 +159,8 @@ mod tests {
         }
 
         let result = S3ObjectStore::new(
-            "bucket".to_owned(),
-            "us-east-1".to_owned(),
+            Some("bucket".to_owned()),
+            Some("us-east-1".to_owned()),
             None,
             "prefix/".to_owned(),
         );
@@ -196,8 +204,8 @@ mod tests {
         .unwrap();
 
         let store = S3ObjectStore::new(
-            bucket_name.to_owned(),
-            region,
+            Some(bucket_name.to_owned()),
+            Some(region),
             Some(endpoint),
             "objects/".to_owned(),
         )

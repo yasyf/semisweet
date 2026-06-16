@@ -97,7 +97,6 @@ impl VectorStorageBackend for MemoryVectorStore {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
-    use std::time::SystemTime;
 
     use crate::newtype::{Context, Entity, Key, QueryText};
 
@@ -132,7 +131,6 @@ mod tests {
             keys,
             entities: entityset(entities),
             context: context.map(|c| Context::new(c.to_owned()).unwrap()),
-            date: SystemTime::UNIX_EPOCH,
         }
     }
 

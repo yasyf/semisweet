@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::time::SystemTime;
 
 use crate::embedding::EmbeddingBackend;
 use crate::entity::EntityBackend;
@@ -99,21 +98,34 @@ where
         context: &Option<Context>,
         value: &[u8],
     ) -> Result<()> {
+        let entry = self.prepare(query, keys, context)?;
+        self.commit(&entry, value)
+    }
+
+    /// The slow half of a write — entity extraction + embedding — yielding the entry to
+    /// commit. Split from [`commit`](Self::commit) so the write-behind worker runs it
+    /// off the pending lock and only afterwards decides whether the entry is still wanted.
+    pub fn prepare(
+        &self,
+        query: &QueryText,
+        keys: &BTreeSet<Key>,
+        context: &Option<Context>,
+    ) -> Result<VectorEntry> {
         let entities = self.extract_entities(query, context, false)?;
         let embedding = self.embedding.embed_query(query.as_str())?;
-        let id = EntryId::derive(query, keys);
-        self.object.put(&self.namespace, &id, value)?;
-        self.vector.upsert(
-            &self.namespace,
-            VectorEntry {
-                id,
-                vector: embedding,
-                keys: keys.clone(),
-                entities,
-                context: context.clone(),
-                date: SystemTime::now(),
-            },
-        )
+        Ok(VectorEntry {
+            id: EntryId::derive(query, keys),
+            vector: embedding,
+            keys: keys.clone(),
+            entities,
+            context: context.clone(),
+        })
+    }
+
+    /// The fast half of a write — object put + vector upsert.
+    pub fn commit(&self, entry: &VectorEntry, value: &[u8]) -> Result<()> {
+        self.object.put(&self.namespace, &entry.id, value)?;
+        self.vector.upsert(&self.namespace, entry.clone())
     }
 
     pub fn delete(

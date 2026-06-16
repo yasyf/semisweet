@@ -15,11 +15,11 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use super::state::{DaemonState, NamespaceEntry};
+use super::state::{DaemonState, NamespaceEntry, PendingWrites};
 use super::supervisor::ClientEvent;
 use super::writer::WriteJob;
 use crate::error::{Error, Result};
-use crate::newtype::{Context, Key, QueryText};
+use crate::newtype::{Context, EntryId, Key, QueryText};
 use crate::protocol::{self, MAX_FRAME_BYTES, ProtocolError, Request, Response};
 use crate::registry::{self, NamespaceConfig};
 
@@ -141,7 +141,7 @@ async fn handle_register(
     config_json: String,
 ) -> Response {
     match state.resolve(&namespace) {
-        Ok(Some(_)) => return Response::Registered { ready: true },
+        Ok(Some(_)) => return Response::Registered,
         Ok(None) => {}
         Err(error) => return backend_error(error),
     }
@@ -162,9 +162,10 @@ async fn handle_register(
         Ok(cache) => {
             let entry = Arc::new(NamespaceEntry {
                 cache: Arc::new(cache),
+                pending: Arc::new(PendingWrites::default()),
             });
             match state.register(namespace, entry) {
-                Ok(()) => Response::Registered { ready: true },
+                Ok(()) => Response::Registered,
                 Err(error) => backend_error(error),
             }
         }
@@ -187,6 +188,16 @@ async fn handle_get(
         Ok(parts) => parts,
         Err(response) => return response,
     };
+    // Read-after-write: an in-flight `set` for this exact entry is served straight
+    // from the pending shadow, before (and instead of) the embed + vector-search path.
+    let id = EntryId::derive(&query, &keys);
+    match entry.pending.get(&id) {
+        Ok(Some(value)) => {
+            return Response::Value(Some(serde_bytes::ByteBuf::from(value.to_vec())));
+        }
+        Ok(None) => {}
+        Err(error) => return backend_error(error),
+    }
     let cache = entry.cache.clone();
     match state
         .inference
@@ -214,14 +225,31 @@ fn handle_set(
         Ok(parts) => parts,
         Err(response) => return response,
     };
+    let id = EntryId::derive(&query, &keys);
+    let value: Arc<[u8]> = Arc::from(value);
+    // Record the shadow before enqueueing: were the order reversed, a worker could run
+    // and remove the (not-yet-inserted) id, leaking the value into the buffer forever.
+    if let Err(error) = entry.pending.insert(id, value.clone()) {
+        return backend_error(error);
+    }
     let job = WriteJob {
         cache: entry.cache.clone(),
+        pending: entry.pending.clone(),
+        id,
         query,
         keys,
         context,
         value,
     };
-    Response::Accepted(state.writer.try_push(job))
+    let accepted = state.writer.try_push(job);
+    if !accepted {
+        // The bounded queue is full, so this write will never run; drop the shadow
+        // rather than advertise a read-after-write hit that never lands.
+        if let Err(error) = entry.pending.remove(&id) {
+            return backend_error(error);
+        }
+    }
+    Response::Accepted(accepted)
 }
 
 async fn handle_del(
@@ -239,13 +267,24 @@ async fn handle_del(
         Ok(parts) => parts,
         Err(response) => return response,
     };
+    // Drop any in-flight shadow so the delete both wins over a pending hit and counts
+    // as a real deletion even before the write-behind has made the entry durable. A
+    // delete observed before the matching write commits also makes that job skip (it no
+    // longer `holds` its value); a delete that races in mid-commit is not ordered against
+    // the write, so that one entry can still land durably — an accepted bound of the
+    // lock-free write-behind, not a guarantee.
+    let id = EntryId::derive(&query, &keys);
+    let removed_pending = match entry.pending.remove(&id) {
+        Ok(removed) => removed,
+        Err(error) => return backend_error(error),
+    };
     let cache = entry.cache.clone();
     match state
         .inference
         .run(move || cache.delete(&query, &keys, &context))
         .await
     {
-        Ok(deleted) => Response::Deleted(deleted),
+        Ok(deleted) => Response::Deleted(removed_pending || deleted),
         Err(error) => backend_error(error),
     }
 }

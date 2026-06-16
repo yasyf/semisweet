@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
 
 use semisweet::{
     ClientStub, EmbeddingChoice, EntityChoice, Launcher, NamespaceConfig, ObjectChoice, Request,
@@ -16,7 +15,6 @@ use semisweet::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_semisweet-daemon");
 const NAMESPACE: &str = "serving";
-const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -74,7 +72,7 @@ impl Drop for TestEnv {
 
 fn disk_config(root: &str) -> NamespaceConfig {
     NamespaceConfig {
-        embedding: EmbeddingChoice::Local,
+        embedding: EmbeddingChoice::Local { model: None },
         entity: EntityChoice::Keyword { language: None },
         vector: VectorChoice::Memory,
         object: ObjectChoice::Disk {
@@ -112,19 +110,12 @@ fn del_request(query: &str) -> Request {
     }
 }
 
-fn poll_until_hit(stub: &mut ClientStub, query: &str, expected: &[u8]) -> bool {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    loop {
-        if let Response::Value(Some(buf)) = stub.request(&get_request(query)).unwrap()
-            && buf.as_slice() == expected
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+fn assert_hit(stub: &mut ClientStub, query: &str, expected: &[u8]) {
+    assert_eq!(
+        stub.request(&get_request(query)).unwrap(),
+        Response::Value(Some(serde_bytes::ByteBuf::from(expected.to_vec()))),
+        "read-after-write: get should return the just-set value with no polling"
+    );
 }
 
 #[test]
@@ -142,19 +133,17 @@ fn serving_roundtrips_over_the_real_daemon() {
             config_json,
         })
         .unwrap();
-    assert_eq!(registered, Response::Registered { ready: true });
+    assert_eq!(registered, Response::Registered);
 
-    // (i) async set then poll until the writer drains and the full get path hits.
+    // (i) async set; read-after-write means the very next get returns the value
+    // immediately, served from the pending shadow with no polling.
     let paris = b"paris".to_vec();
     assert_eq!(
         stub.request(&set_request("what is the capital of france", paris.clone()))
             .unwrap(),
         Response::Accepted(true)
     );
-    assert!(
-        poll_until_hit(&mut stub, "what is the capital of france", &paris),
-        "the writer should drain and a get should return the stored value"
-    );
+    assert_hit(&mut stub, "what is the capital of france", &paris);
 
     // (ii) an unrelated query misses.
     assert_eq!(
@@ -181,10 +170,7 @@ fn serving_roundtrips_over_the_real_daemon() {
             .unwrap(),
         Response::Accepted(true)
     );
-    assert!(
-        poll_until_hit(&mut stub, "a very large blob", &large),
-        "a ~10 MiB value should round-trip through set and get"
-    );
+    assert_hit(&mut stub, "a very large blob", &large);
 
     stub.bye().unwrap();
 }

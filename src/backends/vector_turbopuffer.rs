@@ -3,7 +3,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::RwLock;
-use std::time::UNIX_EPOCH;
 
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -116,12 +115,6 @@ impl VectorStorageBackend for TurbopufferVectorStore {
             });
         }
 
-        let date = entry
-            .date
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| Error::VectorStorage(Box::new(e)))?
-            .as_secs();
-
         let mut row = Map::new();
         row.insert("id".to_owned(), json!(entry.id.to_string()));
         row.insert("vector".to_owned(), json!(entry.vector.values()));
@@ -142,7 +135,6 @@ impl VectorStorageBackend for TurbopufferVectorStore {
         if let Some(context) = &entry.context {
             row.insert("context".to_owned(), json!(context.as_str()));
         }
-        row.insert("date".to_owned(), json!(date));
 
         let body = json!({
             "upsert_rows": [Value::Object(row)],
@@ -152,7 +144,6 @@ impl VectorStorageBackend for TurbopufferVectorStore {
                 "entities": { "type": "[]string", "filterable": true },
                 "keys": { "type": "[]string", "filterable": true },
                 "context": { "type": "string" },
-                "date": { "type": "uint" },
             },
         });
 
@@ -296,8 +287,6 @@ fn is_dimension_error(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use httpmock::prelude::*;
 
     use super::*;
@@ -305,7 +294,6 @@ mod tests {
 
     const NS_NAME: &str = "ns";
     const PHYSICAL_PATH: &str = "/v2/namespaces/semisweet-ns";
-    const FIXED_DATE_SECS: u64 = 1_700_000_000;
 
     fn namespace() -> Namespace {
         Namespace::new(NS_NAME.to_owned()).unwrap()
@@ -331,7 +319,6 @@ mod tests {
             keys,
             entities,
             context: Some(Context::new("ctx".to_owned()).unwrap()),
-            date: UNIX_EPOCH + Duration::from_secs(FIXED_DATE_SECS),
         }
     }
 
@@ -398,7 +385,6 @@ mod tests {
                 "entities": ["aspirin"],
                 "keys": ["k1"],
                 "context": "ctx",
-                "date": FIXED_DATE_SECS,
             }],
             "distance_metric": "cosine_distance",
             "schema": {
@@ -406,7 +392,6 @@ mod tests {
                 "entities": { "type": "[]string", "filterable": true },
                 "keys": { "type": "[]string", "filterable": true },
                 "context": { "type": "string" },
-                "date": { "type": "uint" },
             },
         });
         let mock = server.mock(|when, then| {
