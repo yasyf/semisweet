@@ -26,19 +26,6 @@ const MODEL_ENV: &str = "SEMISWEET_GLINER_MODEL";
 const FULL_THRESHOLD: f32 = 0.50;
 const FAST_CUTOFF: f32 = 0.85;
 
-const DEFAULT_LABELS: [&str; 10] = [
-    "person",
-    "organization",
-    "location",
-    "product",
-    "event",
-    "date",
-    "work_of_art",
-    "law",
-    "language",
-    "misc",
-];
-
 fn entities_from_spans(spans: &[(String, f32)], cutoff: f32) -> BTreeSet<Entity> {
     spans
         .iter()
@@ -61,10 +48,6 @@ impl GlinerEntities {
         let model = GLiNER::<SpanMode>::new(params, Default::default(), tokenizer_path, model_path)
             .map_err(Error::EntityExtraction)?;
         Ok(Self { model, labels })
-    }
-
-    pub fn with_default_labels() -> Result<Self> {
-        Self::new(DEFAULT_LABELS.iter().map(|s| (*s).to_owned()).collect())
     }
 
     fn scored_spans(&self, text: &str) -> Result<Vec<(String, f32)>> {
@@ -144,7 +127,11 @@ mod tests {
     #[test]
     #[ignore = "downloads GLiNER model"]
     fn extract_fast_is_subset_of_full_end_to_end() {
-        let backend = GlinerEntities::with_default_labels().unwrap();
+        let labels = ["person", "organization", "location"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let backend = GlinerEntities::new(labels).unwrap();
         let text = "Barack Obama was born in Hawaii and later worked with Microsoft.";
 
         let full = backend.extract(text, false).unwrap();

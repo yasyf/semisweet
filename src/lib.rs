@@ -13,6 +13,7 @@ mod newtype;
 mod object;
 mod paths;
 mod protocol;
+mod python;
 mod registry;
 mod scoring;
 mod vector;
@@ -39,6 +40,10 @@ pub use vector::{Filter, ScoredHit, VectorEntry, VectorStorageBackend};
 
 /// The `semisweet` Python extension module.
 #[pymodule]
-fn semisweet(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn semisweet(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<python::PyCacheQuery>()?;
+    m.add_class::<python::SemanticCacheBuilder>()?;
+    m.add_class::<python::PySemanticCache>()?;
+    m.add_function(pyo3::wrap_pyfunction!(python::_run_daemon, m)?)?;
     Ok(())
 }

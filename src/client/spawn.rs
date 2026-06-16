@@ -10,13 +10,31 @@ use crate::error::Result;
 use crate::paths;
 use crate::protocol::PROTOCOL_VERSION;
 
-const ENV_PYTHON: &str = "SEMISWEET_PYTHON";
 const ENV_IDLE_SECS: &str = "SEMISWEET_IDLE_SECS";
+const ENV_MODEL_CACHE: &str = "SEMISWEET_MODEL_CACHE";
+
+// Credential and model-location variables the daemon's backends read at
+// construction. The daemon runs detached with `cwd = /`, so the spawning client
+// forwards exactly the variables its chosen backends need.
+const PASSTHROUGH_ENV: &[&str] = &[
+    "VOYAGE_API_KEY",
+    "TURBOPUFFER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "S3_ENDPOINT",
+    "SEMISWEET_GLINER_TOKENIZER",
+    "SEMISWEET_GLINER_MODEL",
+    "HF_HOME",
+];
 
 #[derive(Debug, Clone)]
 pub enum Launcher {
-    Python,
+    Python { executable: PathBuf },
     Exe(PathBuf),
+}
+
+fn default_model_cache() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|base| base.cache_dir().join("semisweet").join("models"))
 }
 
 pub(crate) fn spawn_daemon(launcher: &Launcher) -> Result<()> {
@@ -31,12 +49,8 @@ pub(crate) fn spawn_daemon(launcher: &Launcher) -> Result<()> {
     let stderr = stdout.try_clone()?;
 
     let mut command = match launcher {
-        Launcher::Python => {
-            // TODO(phase 4): capture sys.executable from the live interpreter and
-            // pass it here; semisweet._run_daemon() lands in Phase 4. SEMISWEET_PYTHON
-            // overrides the interpreter until then.
-            let python = std::env::var_os(ENV_PYTHON).unwrap_or_else(|| "python3".into());
-            let mut command = Command::new(python);
+        Launcher::Python { executable } => {
+            let mut command = Command::new(executable);
             command.args(["-c", "import semisweet; semisweet._run_daemon()"]);
             command
         }
@@ -52,6 +66,26 @@ pub(crate) fn spawn_daemon(launcher: &Launcher) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+
+    for var in PASSTHROUGH_ENV {
+        if let Some(value) = std::env::var_os(var) {
+            command.env(var, value);
+        }
+    }
+
+    // fastembed's default model cache is relative to the working directory; the
+    // daemon runs with `cwd = /`, so pin an absolute cache dir. Honour an explicit
+    // override, otherwise default to a stable per-user cache path.
+    match std::env::var_os(ENV_MODEL_CACHE) {
+        Some(value) => {
+            command.env(ENV_MODEL_CACHE, value);
+        }
+        None => {
+            if let Some(cache) = default_model_cache() {
+                command.env(ENV_MODEL_CACHE, cache);
+            }
+        }
+    }
 
     if let Some(idle) = std::env::var_os(ENV_IDLE_SECS) {
         command.env(ENV_IDLE_SECS, idle);

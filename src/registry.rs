@@ -109,7 +109,7 @@ fn context_name(mode: ContextMode) -> &'static str {
 }
 
 impl ScoringDto {
-    fn to_config(&self) -> Result<ScoringConfig> {
+    pub(crate) fn to_config(&self) -> Result<ScoringConfig> {
         if self.floor_threshold > self.base_threshold {
             return Err(Error::InvalidConfig(format!(
                 "floor_threshold {} exceeds base_threshold {}",
@@ -393,6 +393,10 @@ mod tests {
         ));
     }
 
+    // Only meaningful when `gliner` is compiled OUT: with the feature on,
+    // build_cache constructs the backend and fails later (missing model env)
+    // rather than reporting an unknown backend.
+    #[cfg(not(feature = "gliner"))]
     #[test]
     fn build_cache_rejects_feature_off_backend() {
         let mut config = offline_config("/tmp/unused");

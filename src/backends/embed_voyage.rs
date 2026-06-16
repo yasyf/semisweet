@@ -16,8 +16,6 @@ use crate::error::{Error, Result};
 use crate::newtype::{Dim, Embedding};
 
 const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1/embeddings";
-const DEFAULT_MODEL: &str = "voyage-3.5-lite";
-const DEFAULT_DIM: usize = 512;
 const API_KEY_ENV: &str = "VOYAGE_API_KEY";
 const BASE_URL_ENV: &str = "VOYAGE_API_BASE";
 const OUTPUT_DTYPE: &str = "float";
@@ -80,12 +78,6 @@ impl VoyageEmbedding {
             dim: Dim::new(output_dimension.get())?,
             base_url,
         })
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> Result<Self> {
-        let output_dimension = NonZeroUsize::new(DEFAULT_DIM).ok_or(Error::EmptyEmbedding)?;
-        Self::new(DEFAULT_MODEL.to_owned(), output_dimension)
     }
 
     fn embed(&self, text: &str, input_type: &str) -> Result<Embedding> {
@@ -277,32 +269,16 @@ mod tests {
         unsafe {
             std::env::remove_var(API_KEY_ENV);
         }
-        let dim = NonZeroUsize::new(DEFAULT_DIM).unwrap();
+        let dim = NonZeroUsize::new(512).unwrap();
         let result = VoyageEmbedding::new("voyage-3.5-lite".to_owned(), dim);
         assert!(matches!(result, Err(Error::MissingEnv("VOYAGE_API_KEY"))));
     }
 
     #[test]
-    fn default_targets_voyage_lite_512() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: serialized by ENV_LOCK against the other env-touching tests.
-        unsafe {
-            std::env::set_var(API_KEY_ENV, "k");
-        }
-        let backend = VoyageEmbedding::default().unwrap();
-        assert_eq!(backend.model, "voyage-3.5-lite");
-        assert_eq!(backend.dim.get(), 512);
-        // SAFETY: serialized by ENV_LOCK against the other env-touching tests.
-        unsafe {
-            std::env::remove_var(API_KEY_ENV);
-        }
-    }
-
-    #[test]
     #[ignore = "hits the live Voyage API; requires VOYAGE_API_KEY"]
     fn live_embed_query_returns_configured_dim() {
-        let dim = NonZeroUsize::new(DEFAULT_DIM).unwrap();
-        let backend = VoyageEmbedding::new(DEFAULT_MODEL.to_owned(), dim).unwrap();
+        let dim = NonZeroUsize::new(512).unwrap();
+        let backend = VoyageEmbedding::new("voyage-3.5-lite".to_owned(), dim).unwrap();
         let embedding = backend.embed_query("what is aspirin used for").unwrap();
         assert_eq!(embedding.dim().get(), 512);
         let norm = embedding.values().iter().map(|v| v * v).sum::<f32>().sqrt();

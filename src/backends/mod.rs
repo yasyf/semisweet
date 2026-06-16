@@ -3,11 +3,6 @@
 //! `vector_memory` and `object_disk` use only `std` and always compile; the rest
 //! are gated behind their backend's Cargo feature.
 
-// TODO(phase 4): drop once the builder/registry constructs each backend; until that
-// wiring lands the backends are unreachable from any public path and the non-test
-// lib build flags every constructor as dead code.
-#![allow(dead_code)]
-
 pub mod object_disk;
 pub mod vector_memory;
 

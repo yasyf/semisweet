@@ -1,6 +1,8 @@
 use pyo3::PyErr;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 
+use crate::protocol::ProtocolError;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub type BackendError = Box<dyn std::error::Error + Send + Sync>;
@@ -75,6 +77,21 @@ impl From<Error> for PyErr {
             | Error::Daemon(_)
             | Error::Io(_)
             | Error::Codec(_) => PyRuntimeError::new_err(err.to_string()),
+        }
+    }
+}
+
+impl From<ProtocolError> for PyErr {
+    fn from(err: ProtocolError) -> PyErr {
+        match err {
+            ProtocolError::InvalidRequest(message) => PyValueError::new_err(message),
+            ProtocolError::UnknownNamespace(namespace) => {
+                PyKeyError::new_err(format!("unknown namespace `{namespace}`"))
+            }
+            ProtocolError::VersionMismatch { client, daemon } => PyRuntimeError::new_err(format!(
+                "protocol version mismatch: client {client}, daemon {daemon}"
+            )),
+            ProtocolError::BackendInit(message) => PyRuntimeError::new_err(message),
         }
     }
 }
