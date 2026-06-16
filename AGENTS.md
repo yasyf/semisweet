@@ -1,6 +1,6 @@
 # semisweet Development Guide
 
-An in-memory semantic cache backed by turbopuffer.
+An async, in-memory semantic cache with pluggable backends.
 
 ## Repository Structure
 

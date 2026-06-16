@@ -5,9 +5,9 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/yasyf/semisweet/ci.yml?branch=main&label=CI)](https://github.com/yasyf/semisweet/actions/workflows/ci.yml)
 [![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/License-PolyForm--Noncommercial--1.0.0-blue.svg)](https://github.com/yasyf/semisweet/blob/main/LICENSE)
 
-An in-memory semantic cache backed by turbopuffer.
+An async, in-memory semantic cache with pluggable backends.
 
-semisweet caches by meaning. Store a payload against a query, and any semantically close query gets it back from process memory in microseconds — no recompute, no vector-store round trip. The hot index lives in process; point it at [turbopuffer](https://turbopuffer.com) when recall has to outlive a process or outgrow RAM, and payloads offload to disk or S3 so the index stays lean. The core is Rust, exposed to Python through pyo3.
+semisweet caches by meaning. Store a payload against a query, and any semantically close query gets it back from process memory in microseconds — no recompute, no vector-store round trip. The hot index lives in process; point it at [turbopuffer](https://turbopuffer.com) when recall has to outlive a process or outgrow RAM, and payloads offload to disk or S3 so the index stays lean. The core is Rust, exposed to Python through pyo3, and the Python interface is async-native: `get`, `set`, and `delete` are coroutines you await.
 
 ## Install
 
@@ -24,23 +24,27 @@ The default build runs fully offline — local BGE embeddings, keyword entities,
 A namespace is the whole setup: every backend defaults to the local stack, so this needs no API keys.
 
 ```python
+import asyncio
 import semisweet
 
-cache = semisweet.SemanticCache(namespace="research-cache")
+async def main():
+    cache = semisweet.SemanticCache(namespace="research-cache")  # sync config, no I/O
+    # `set` is read-after-write: a `get` for the same query returns the value at once.
+    await cache.set(semisweet.CacheQuery(query="what is the capital of france"), b"paris")
+    # A reworded query still hits the stored entry.
+    hit = await cache.get(semisweet.CacheQuery(query="france's capital?"))
+    print(hit)
 
-# `set` is read-after-write: a `get` for the same query returns the value at once.
-cache.set(semisweet.CacheQuery(query="what is the capital of france"), b"paris")
-
-# A reworded query still hits the stored entry.
-hit = cache.get(semisweet.CacheQuery(query="france's capital?"))
-print(hit)
+asyncio.run(main())
 ```
 
 ```
 b'paris'
 ```
 
-`CacheQuery(query=..., keys=..., context=...)` is keyword-only. `keys` is an optional contains-all filter; `context` is optional fallback text for entity extraction and tie-breaking. `get` returns `bytes` or `None`, and `delete` returns whether the entry existed.
+`CacheQuery(query=..., keys=..., context=...)` is keyword-only. `keys` is an optional contains-all filter; `context` is optional fallback text for entity extraction and tie-breaking. Constructing the cache is synchronous and does no I/O; the first `await` transparently spawns and connects a shared per-user daemon. `get`, `set`, and `delete` are awaitable: `get` returns `bytes` or `None`, and `delete` returns whether the entry existed.
+
+You rarely manage the daemon by hand — it idle-shuts-down on its own. When you do, `await semisweet.shutdown_daemon()` stops the shared daemon and returns whether one was running.
 
 ## Backends
 
@@ -61,13 +65,13 @@ Local models (BGE, and GLiNER under `--features gliner`) auto-download from the 
 | `TURBOPUFFER_API_KEY` | `TurbopufferVectors` |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_ENDPOINT`, `SEMISWEET_S3_BUCKET` | `S3Storage` |
 
-The first cache spawns a shared per-user daemon that holds the models and index, so only the first call pays the load cost.
+The first `await` spawns a shared per-user daemon that holds the models and index, so only that first call pays the load cost.
 
 ## Development
 
 ```bash
 cargo test
-uv venv && uvx maturin develop --uv && uv pip install pytest && pytest
+uv venv && uvx maturin develop --uv && uv pip install pytest pytest-asyncio && pytest
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions.
