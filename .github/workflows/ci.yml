@@ -83,10 +83,11 @@ jobs:
       - name: import smoke test
         run: python -c "import semisweet"
 
-      # maturin installs only the extension; pytest must be added explicitly or the
-      # next step is `pytest: command not found`.
+      # maturin installs only the extension; the PEP 735 `test` group (pytest,
+      # pytest-asyncio, pydantic) must be installed explicitly, or the next step is
+      # `pytest: command not found` (and the pydantic-backed tests fail to import).
       - name: install test deps
-        run: uv pip install pytest pytest-asyncio
+        run: uv pip install --group test
 
       # The construction/validation cases run; the BGE-backed roundtrip cases self-skip
       # via @needs_model (no model on disk here). Deterministic, no network at test time.
@@ -132,7 +133,7 @@ jobs:
         run: uvx maturin develop --uv --features local-embed
 
       - name: install test deps
-        run: uv pip install pytest pytest-asyncio
+        run: uv pip install --group test
 
       # Full suite: BGE-backed roundtrip + the offline cases. The fixture monkeypatches
       # SEMISWEET_MODEL_CACHE to .fastembed_cache; HF_HOME gives hf-hub a writable home.
