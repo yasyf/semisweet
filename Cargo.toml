@@ -102,6 +102,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # exposes a sync container runner to match the sync s3 client.
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["minio", "blocking"] }
+# Throughput/latency benchmarks (benches/concurrency.rs). Statistical sampling +
+# HTML reports drive the measure-first sign-off for the embedding hot path.
+criterion = "0.5"
 
 [features]
 # Batteries-included by default: the zero-config `SemanticCache(namespace=...)` runs
@@ -116,3 +119,7 @@ keyword = ["dep:yake-rust"]
 s3 = ["dep:rust-s3"]
 local-embed = ["onnx", "dep:fastembed"]
 gliner = ["onnx", "dep:gline-rs", "dep:hf-hub"]
+
+[[bench]]
+name = "concurrency"
+harness = false
