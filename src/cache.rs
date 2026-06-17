@@ -65,6 +65,12 @@ where
     ) -> Result<Option<ScoredHit>> {
         let entities = self.extract_entities(query, context, true)?;
         let embedding = self.embedding.embed_query(query.as_str())?;
+        let context_vector = match context {
+            Some(context) if self.scoring.uses_context_dense() => {
+                Some(self.embedding.embed_query(context.as_str())?)
+            }
+            _ => None,
+        };
         let filter = Filter {
             keys_all: keys.clone(),
             entities_any: if self.scoring.entity_filter {
@@ -73,10 +79,15 @@ where
                 BTreeSet::new()
             },
         };
-        let hits = self
-            .vector
-            .query(&self.namespace, &embedding, &filter, self.scoring.top_k)?;
-        Ok(self.scoring.select(&entities, context, hits))
+        let hits = self.vector.query(
+            &self.namespace,
+            &embedding,
+            query,
+            &filter,
+            self.scoring.top_k,
+        )?;
+        self.scoring
+            .select(&entities, context, &context_vector, hits)
     }
 
     pub fn get(
@@ -113,12 +124,18 @@ where
     ) -> Result<VectorEntry> {
         let entities = self.extract_entities(query, context, false)?;
         let embedding = self.embedding.embed_query(query.as_str())?;
+        let context_vector = match context {
+            Some(context) => Some(self.embedding.embed_query(context.as_str())?),
+            None => None,
+        };
         Ok(VectorEntry {
             id: EntryId::derive(query, keys),
             vector: embedding,
+            query_text: query.clone(),
             keys: keys.clone(),
             entities,
             context: context.clone(),
+            context_vector,
         })
     }
 
@@ -178,6 +195,19 @@ mod tests {
 
     fn query(text: &str) -> QueryText {
         QueryText::new(text.to_owned()).unwrap()
+    }
+
+    /// A stand-in for the backends' BM25: token Jaccard of the query against the stored query
+    /// text, in `[0, 1]`. Identical text scores 1.0 so an exact-match GET fuses high enough to
+    /// clear the recalibrated threshold.
+    fn jaccard(query_tokens: &BTreeSet<&str>, doc: &str) -> f32 {
+        let doc_tokens: BTreeSet<&str> = doc.split_whitespace().collect();
+        if query_tokens.is_empty() || doc_tokens.is_empty() {
+            return 0.0;
+        }
+        let intersection = query_tokens.intersection(&doc_tokens).count();
+        let union = query_tokens.union(&doc_tokens).count();
+        intersection as f32 / union as f32
     }
 
     struct FakeEmbedding {
@@ -274,6 +304,7 @@ mod tests {
             &self,
             ns: &Namespace,
             vector: &Embedding,
+            query_text: &QueryText,
             filter: &Filter,
             top_k: std::num::NonZeroUsize,
         ) -> Result<Vec<ScoredHit>> {
@@ -281,6 +312,7 @@ mod tests {
             let Some(entries) = store.get(ns) else {
                 return Ok(Vec::new());
             };
+            let query_tokens: BTreeSet<&str> = query_text.as_str().split_whitespace().collect();
             let mut hits: Vec<ScoredHit> = entries
                 .values()
                 .filter(|entry| filter.keys_all.is_subset(&entry.keys))
@@ -290,12 +322,16 @@ mod tests {
                 })
                 .map(|entry| ScoredHit {
                     id: entry.id,
-                    score: vector.dot(&entry.vector).unwrap(),
+                    dense_score: vector.dot(&entry.vector).unwrap(),
+                    sparse_score: jaccard(&query_tokens, entry.query_text.as_str()),
                     entities: entry.entities.clone(),
                     context: entry.context.clone(),
+                    context_vector: entry.context_vector.clone(),
                 })
                 .collect();
-            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+            hits.sort_by(|a, b| {
+                (b.dense_score + b.sparse_score).total_cmp(&(a.dense_score + a.sparse_score))
+            });
             hits.truncate(top_k.get());
             Ok(hits)
         }

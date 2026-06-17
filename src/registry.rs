@@ -111,6 +111,9 @@ pub struct ScoringDto {
     pub base_threshold: f32,
     pub floor_threshold: f32,
     pub entity_bonus_weight: f32,
+    pub dense_weight: f32,
+    pub sparse_weight: f32,
+    pub context_bonus_weight: f32,
     pub top_k: usize,
     pub entity_filter: bool,
     pub context: String,
@@ -123,6 +126,9 @@ impl Default for ScoringDto {
             base_threshold: defaults.base_threshold,
             floor_threshold: defaults.floor_threshold,
             entity_bonus_weight: defaults.entity_bonus_weight,
+            dense_weight: defaults.dense_weight,
+            sparse_weight: defaults.sparse_weight,
+            context_bonus_weight: defaults.context_bonus_weight,
             top_k: defaults.top_k.get(),
             entity_filter: defaults.entity_filter,
             context: context_name(defaults.context).to_owned(),
@@ -157,10 +163,22 @@ impl ScoringDto {
                 self.floor_threshold
             )));
         }
-        if !self.entity_bonus_weight.is_finite() || self.entity_bonus_weight < 0.0 {
+        for (name, weight) in [
+            ("entity_bonus_weight", self.entity_bonus_weight),
+            ("dense_weight", self.dense_weight),
+            ("sparse_weight", self.sparse_weight),
+            ("context_bonus_weight", self.context_bonus_weight),
+        ] {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "{name} {weight} must be finite and >= 0.0"
+                )));
+            }
+        }
+        if self.dense_weight + self.sparse_weight <= 0.0 {
             return Err(Error::InvalidConfig(format!(
-                "entity_bonus_weight {} must be finite and >= 0.0",
-                self.entity_bonus_weight
+                "dense_weight {} + sparse_weight {} must be > 0.0",
+                self.dense_weight, self.sparse_weight
             )));
         }
         let top_k = NonZeroUsize::new(self.top_k)
@@ -178,6 +196,9 @@ impl ScoringDto {
             base_threshold: self.base_threshold,
             floor_threshold: self.floor_threshold,
             entity_bonus_weight: self.entity_bonus_weight,
+            dense_weight: self.dense_weight,
+            sparse_weight: self.sparse_weight,
+            context_bonus_weight: self.context_bonus_weight,
             top_k,
             entity_filter: self.entity_filter,
             context,

@@ -654,11 +654,15 @@ pub(crate) struct PyScoring {
 #[pymethods]
 impl PyScoring {
     #[new]
-    #[pyo3(signature = (*, base = None, floor = None, entity_bonus_weight = None, top_k = None, entity_filter = None, context = None))]
+    #[pyo3(signature = (*, base = None, floor = None, entity_bonus_weight = None, dense_weight = None, sparse_weight = None, context_bonus_weight = None, top_k = None, entity_filter = None, context = None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         base: Option<f32>,
         floor: Option<f32>,
         entity_bonus_weight: Option<f32>,
+        dense_weight: Option<f32>,
+        sparse_weight: Option<f32>,
+        context_bonus_weight: Option<f32>,
         top_k: Option<usize>,
         entity_filter: Option<bool>,
         context: Option<String>,
@@ -668,6 +672,9 @@ impl PyScoring {
             base_threshold: base.unwrap_or(defaults.base_threshold),
             floor_threshold: floor.unwrap_or(defaults.floor_threshold),
             entity_bonus_weight: entity_bonus_weight.unwrap_or(defaults.entity_bonus_weight),
+            dense_weight: dense_weight.unwrap_or(defaults.dense_weight),
+            sparse_weight: sparse_weight.unwrap_or(defaults.sparse_weight),
+            context_bonus_weight: context_bonus_weight.unwrap_or(defaults.context_bonus_weight),
             top_k: top_k.unwrap_or(defaults.top_k),
             entity_filter: entity_filter.unwrap_or(defaults.entity_filter),
             context: context.unwrap_or(defaults.context),
@@ -680,10 +687,13 @@ impl PyScoring {
     /// Render every configured scoring field.
     fn __repr__(&self) -> String {
         format!(
-            "Scoring(base={}, floor={}, entity_bonus_weight={}, top_k={}, entity_filter={}, context='{}')",
+            "Scoring(base={}, floor={}, entity_bonus_weight={}, dense_weight={}, sparse_weight={}, context_bonus_weight={}, top_k={}, entity_filter={}, context='{}')",
             self.dto.base_threshold,
             self.dto.floor_threshold,
             self.dto.entity_bonus_weight,
+            self.dto.dense_weight,
+            self.dto.sparse_weight,
+            self.dto.context_bonus_weight,
             self.dto.top_k,
             py_bool(self.dto.entity_filter),
             self.dto.context

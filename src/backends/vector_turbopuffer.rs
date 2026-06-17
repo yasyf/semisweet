@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
-use crate::newtype::{Context, Dim, Embedding, Entity, EntryId, Namespace};
+use crate::newtype::{Context, Dim, Embedding, Entity, EntryId, Namespace, QueryText};
 use crate::vector::{Filter, ScoredHit, VectorEntry, VectorStorageBackend};
 
 const API_KEY_ENV: &str = "TURBOPUFFER_API_KEY";
@@ -18,11 +18,20 @@ const API_BASE_ENV: &str = "TURBOPUFFER_API_BASE";
 const DEFAULT_BASE_URL: &str = "https://api.turbopuffer.com";
 const DEFAULT_NAMESPACE_PREFIX: &str = "semisweet-";
 const DISTANCE_METRIC: &str = "cosine_distance";
+// turbopuffer hides its FTS corpus statistics, so the raw BM25 `$dist` is squashed into `[0, 1]`
+// by `s / (s + BM25_SATURATION)`. The constant is the BM25 score at which sparse relevance is 0.5.
+const BM25_SATURATION: f32 = 5.0;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Deserialize)]
-struct QueryResponse {
+struct MultiQueryResponse {
+    #[serde(default)]
+    results: Vec<QueryResult>,
+}
+
+#[derive(Deserialize)]
+struct QueryResult {
     #[serde(default)]
     rows: Vec<QueryRow>,
 }
@@ -36,6 +45,8 @@ struct QueryRow {
     entities: Vec<String>,
     #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
+    context_vector: Option<Vec<f32>>,
 }
 
 pub struct TurbopufferVectorStore {
@@ -121,6 +132,7 @@ impl VectorStorageBackend for TurbopufferVectorStore {
         let mut row = Map::new();
         row.insert("id".to_owned(), json!(entry.id.to_string()));
         row.insert("vector".to_owned(), json!(entry.vector.values()));
+        row.insert("query_text".to_owned(), json!(entry.query_text.as_str()));
         row.insert(
             "entities".to_owned(),
             json!(
@@ -138,15 +150,20 @@ impl VectorStorageBackend for TurbopufferVectorStore {
         if let Some(context) = &entry.context {
             row.insert("context".to_owned(), json!(context.as_str()));
         }
+        if let Some(context_vector) = &entry.context_vector {
+            row.insert("context_vector".to_owned(), json!(context_vector.values()));
+        }
 
         let body = json!({
             "upsert_rows": [Value::Object(row)],
             "distance_metric": DISTANCE_METRIC,
             "schema": {
                 "vector": { "type": format!("[{}]f32", dim.get()), "ann": true },
+                "query_text": { "type": "string", "full_text_search": true },
                 "entities": { "type": "[]string", "filterable": true },
                 "keys": { "type": "[]string", "filterable": true },
                 "context": { "type": "string" },
+                "context_vector": { "type": "[]float", "filterable": false },
             },
         });
 
@@ -184,30 +201,46 @@ impl VectorStorageBackend for TurbopufferVectorStore {
         &self,
         ns: &Namespace,
         vector: &Embedding,
+        query_text: &QueryText,
         filter: &Filter,
         top_k: NonZeroUsize,
     ) -> Result<Vec<ScoredHit>> {
-        let mut body = Map::new();
-        body.insert(
+        // Hybrid retrieval is one multi-query round trip: a dense ANN leg and a lexical BM25 leg.
+        // turbopuffer's server-side fusion is rank-based (RRF) only, so we omit `rerank_by`, read
+        // the raw `$dist` from each leg, and fuse with weighted scores client-side in `scoring`.
+        let attributes = json!(["entities", "keys", "context", "context_vector"]);
+        let filters = filter_to_tp(filter);
+
+        let mut ann = Map::new();
+        ann.insert(
             "rank_by".to_owned(),
             json!(["vector", "ANN", vector.values()]),
         );
-        body.insert("top_k".to_owned(), json!(top_k.get()));
-        body.insert("distance_metric".to_owned(), json!(DISTANCE_METRIC));
-        body.insert(
-            "include_attributes".to_owned(),
-            json!(["entities", "keys", "context"]),
-        );
-        if let Some(filters) = filter_to_tp(filter) {
-            body.insert("filters".to_owned(), filters);
+        ann.insert("top_k".to_owned(), json!(top_k.get()));
+        ann.insert("distance_metric".to_owned(), json!(DISTANCE_METRIC));
+        ann.insert("include_attributes".to_owned(), attributes.clone());
+        if let Some(filters) = &filters {
+            ann.insert("filters".to_owned(), filters.clone());
         }
 
+        let mut bm25 = Map::new();
+        bm25.insert(
+            "rank_by".to_owned(),
+            json!(["query_text", "BM25", query_text.as_str()]),
+        );
+        bm25.insert("top_k".to_owned(), json!(top_k.get()));
+        bm25.insert("include_attributes".to_owned(), attributes);
+        if let Some(filters) = &filters {
+            bm25.insert("filters".to_owned(), filters.clone());
+        }
+
+        let body = json!({ "queries": [Value::Object(ann), Value::Object(bm25)] });
         let url = format!(
             "{}/v2/namespaces/{}/query",
             self.base_url,
             self.physical_namespace(ns)
         );
-        let (status, text) = self.execute(&url, &Value::Object(body))?;
+        let (status, text) = self.execute(&url, &body)?;
         if status == StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
@@ -232,9 +265,9 @@ impl VectorStorageBackend for TurbopufferVectorStore {
             ));
         }
 
-        let parsed: QueryResponse =
+        let parsed: MultiQueryResponse =
             serde_json::from_str(&text).map_err(|e| Error::VectorStorage(Box::new(e)))?;
-        parsed.rows.into_iter().map(row_to_hit).collect()
+        fuse_multi_query(parsed)
     }
 
     fn delete(&self, ns: &Namespace, id: &EntryId) -> Result<()> {
@@ -281,7 +314,18 @@ fn filter_to_tp(filter: &Filter) -> Option<Value> {
     }
 }
 
-fn row_to_hit(row: QueryRow) -> Result<ScoredHit> {
+fn squash_bm25(score: f32) -> f32 {
+    score / (score + BM25_SATURATION)
+}
+
+struct ParsedRow {
+    id: EntryId,
+    entities: BTreeSet<Entity>,
+    context: Option<Context>,
+    context_vector: Option<Embedding>,
+}
+
+fn parse_row(row: &QueryRow) -> Result<ParsedRow> {
     let id = EntryId::from_hex(&row.id).ok_or_else(|| {
         Error::VectorStorage(format!("turbopuffer returned an unparseable id `{}`", row.id).into())
     })?;
@@ -290,16 +334,77 @@ fn row_to_hit(row: QueryRow) -> Result<ScoredHit> {
         .iter()
         .filter_map(|e| Entity::normalize(e))
         .collect::<BTreeSet<_>>();
-    let context = match row.context {
-        Some(value) => Some(Context::new(value)?),
+    let context = match &row.context {
+        Some(value) => Some(Context::new(value.clone())?),
         None => None,
     };
-    Ok(ScoredHit {
+    let context_vector = match &row.context_vector {
+        Some(values) => Some(Embedding::new(values.clone())?),
+        None => None,
+    };
+    Ok(ParsedRow {
         id,
-        score: 1.0 - row.dist,
         entities,
         context,
+        context_vector,
     })
+}
+
+/// Fuse the two legs of a hybrid multi-query into one candidate set. The first leg is the dense
+/// ANN result (`$dist` is cosine distance → `dense = 1 - dist`); the second is BM25 (`$dist` is the
+/// BM25 score → squashed into `[0, 1]`). Candidates are unioned by id, preserving the dense leg's
+/// order then the BM25-only tail; a candidate absent from one leg keeps that component at 0.
+fn fuse_multi_query(parsed: MultiQueryResponse) -> Result<Vec<ScoredHit>> {
+    let mut legs = parsed.results.into_iter();
+    let ann_rows = legs.next().map(|leg| leg.rows).unwrap_or_default();
+    let bm25_rows = legs.next().map(|leg| leg.rows).unwrap_or_default();
+
+    let mut hits: HashMap<EntryId, ScoredHit> = HashMap::new();
+    let mut order: Vec<EntryId> = Vec::new();
+
+    for row in &ann_rows {
+        let parsed = parse_row(row)?;
+        let id = parsed.id;
+        if !hits.contains_key(&id) {
+            order.push(id);
+        }
+        hits.insert(
+            id,
+            ScoredHit {
+                id,
+                dense_score: 1.0 - row.dist,
+                sparse_score: 0.0,
+                entities: parsed.entities,
+                context: parsed.context,
+                context_vector: parsed.context_vector,
+            },
+        );
+    }
+    for row in &bm25_rows {
+        let parsed = parse_row(row)?;
+        let id = parsed.id;
+        match hits.get_mut(&id) {
+            Some(hit) => hit.sparse_score = squash_bm25(row.dist),
+            None => {
+                order.push(id);
+                hits.insert(
+                    id,
+                    ScoredHit {
+                        id,
+                        dense_score: 0.0,
+                        sparse_score: squash_bm25(row.dist),
+                        entities: parsed.entities,
+                        context: parsed.context,
+                        context_vector: parsed.context_vector,
+                    },
+                );
+            }
+        }
+    }
+    Ok(order
+        .into_iter()
+        .filter_map(|id| hits.remove(&id))
+        .collect())
 }
 
 // turbopuffer exposes no stable structured error code or field for a vector
@@ -319,7 +424,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use super::*;
-    use crate::newtype::{Key, QueryText};
+    use crate::newtype::Key;
 
     const NS_NAME: &str = "ns";
     const PHYSICAL_PATH: &str = "/v2/namespaces/semisweet-ns";
@@ -346,9 +451,11 @@ mod tests {
         VectorEntry {
             id: EntryId::derive(&query, &keys),
             vector: Embedding::new(values).unwrap(),
+            query_text: query,
             keys,
             entities,
             context: Some(Context::new("ctx".to_owned()).unwrap()),
+            context_vector: None,
         }
     }
 
@@ -412,6 +519,7 @@ mod tests {
             "upsert_rows": [{
                 "id": entry.id.to_string(),
                 "vector": [0.0, 1.0],
+                "query_text": "dose",
                 "entities": ["aspirin"],
                 "keys": ["k1"],
                 "context": "ctx",
@@ -419,9 +527,11 @@ mod tests {
             "distance_metric": "cosine_distance",
             "schema": {
                 "vector": { "type": "[2]f32", "ann": true },
+                "query_text": { "type": "string", "full_text_search": true },
                 "entities": { "type": "[]string", "filterable": true },
                 "keys": { "type": "[]string", "filterable": true },
                 "context": { "type": "string" },
+                "context_vector": { "type": "[]float", "filterable": false },
             },
         });
         let mock = server.mock(|when, then| {
@@ -437,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn query_sends_ann_filters_and_parses_scores() {
+    fn query_sends_multi_query_and_fuses_scores() {
         let server = MockServer::start();
         let store = store_for(&server);
 
@@ -453,27 +563,45 @@ mod tests {
         .collect();
         let entities: BTreeSet<Entity> = [Entity::normalize("e1").unwrap()].into_iter().collect();
 
-        let expected_body = json!({
-            "rank_by": ["vector", "ANN", [0.0, 1.0]],
-            "top_k": 3,
-            "distance_metric": "cosine_distance",
-            "include_attributes": ["entities", "keys", "context"],
-            "filters": [
-                "And",
+        let filters = json!([
+            "And",
+            [
                 [
-                    ["And", [["keys", "Contains", "k1"], ["keys", "Contains", "k2"]]],
-                    ["Or", [["entities", "Contains", "e1"]]]
-                ]
+                    "And",
+                    [["keys", "Contains", "k1"], ["keys", "Contains", "k2"]]
+                ],
+                ["Or", [["entities", "Contains", "e1"]]]
+            ]
+        ]);
+        let attributes = json!(["entities", "keys", "context", "context_vector"]);
+        let expected_body = json!({
+            "queries": [
+                {
+                    "rank_by": ["vector", "ANN", [0.0, 1.0]],
+                    "top_k": 3,
+                    "distance_metric": "cosine_distance",
+                    "include_attributes": attributes,
+                    "filters": filters,
+                },
+                {
+                    "rank_by": ["query_text", "BM25", "dose"],
+                    "top_k": 3,
+                    "include_attributes": attributes,
+                    "filters": filters,
+                }
             ],
         });
         let response = json!({
-            "rows": [{
-                "id": row_id.to_string(),
-                "$dist": 0.25,
-                "entities": ["aspirin"],
-                "keys": ["k1"],
-                "context": "ctx",
-            }],
+            "results": [
+                { "rows": [{
+                    "id": row_id.to_string(),
+                    "$dist": 0.25,
+                    "entities": ["aspirin"],
+                    "keys": ["k1"],
+                    "context": "ctx",
+                }] },
+                { "rows": [{ "id": row_id.to_string(), "$dist": 5.0 }] }
+            ],
         });
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -483,11 +611,13 @@ mod tests {
         });
 
         let vector = Embedding::new(vec![0.0, 1.0]).unwrap();
+        let query_text = QueryText::new("dose".to_owned()).unwrap();
         let filter = Filter::new(keys, entities);
         let hits = store
             .query(
                 &namespace(),
                 &vector,
+                &query_text,
                 &filter,
                 NonZeroUsize::new(3).unwrap(),
             )
@@ -496,7 +626,9 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, row_id);
-        assert!((hits[0].score - 0.75).abs() < 1e-6);
+        assert!((hits[0].dense_score - 0.75).abs() < 1e-6);
+        // squash_bm25(5.0) = 5 / (5 + 5) = 0.5
+        assert!((hits[0].sparse_score - 0.5).abs() < 1e-6);
         assert_eq!(
             hits[0].entities,
             [Entity::normalize("aspirin").unwrap()]
@@ -515,12 +647,15 @@ mod tests {
             &[Key::new("k1".to_owned()).unwrap()].into_iter().collect(),
         );
         let response = json!({
-            "rows": [{
-                "id": row_id.to_string(),
-                "entities": ["aspirin"],
-                "keys": ["k1"],
-                "context": "ctx",
-            }],
+            "results": [
+                { "rows": [{
+                    "id": row_id.to_string(),
+                    "entities": ["aspirin"],
+                    "keys": ["k1"],
+                    "context": "ctx",
+                }] },
+                { "rows": [] }
+            ],
         });
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v2/namespaces/semisweet-ns/query");
@@ -532,6 +667,7 @@ mod tests {
             .query(
                 &namespace(),
                 &vector,
+                &QueryText::new("dose".to_owned()).unwrap(),
                 &Filter::default(),
                 NonZeroUsize::new(1).unwrap(),
             )
@@ -555,6 +691,7 @@ mod tests {
             .query(
                 &namespace(),
                 &vector,
+                &QueryText::new("dose".to_owned()).unwrap(),
                 &Filter::default(),
                 NonZeroUsize::new(1).unwrap(),
             )
@@ -594,6 +731,7 @@ mod tests {
             .query(
                 &namespace(),
                 &vector,
+                &QueryText::new("dose".to_owned()).unwrap(),
                 &Filter::default(),
                 NonZeroUsize::new(1).unwrap(),
             )
@@ -616,6 +754,7 @@ mod tests {
             .query(
                 &namespace(),
                 &vector,
+                &QueryText::new("dose".to_owned()).unwrap(),
                 &Filter::default(),
                 NonZeroUsize::new(1).unwrap(),
             )
@@ -678,6 +817,7 @@ mod tests {
             .query(
                 &ns,
                 &vector,
+                &QueryText::new("dose".to_owned()).unwrap(),
                 &Filter::default(),
                 NonZeroUsize::new(5).unwrap(),
             )

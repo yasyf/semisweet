@@ -56,6 +56,29 @@ def test_scoring_floor_above_base_raises():
         Scoring(base=0.90, floor=0.95)
 
 
+def test_scoring_zero_hybrid_weights_raises():
+    # dense_weight + sparse_weight must be > 0, else the fused score divides by zero. Rejected
+    # eagerly in the constructor.
+    with pytest.raises(ValueError):
+        Scoring(dense_weight=0.0, sparse_weight=0.0)
+
+
+def test_scoring_negative_weight_raises():
+    with pytest.raises(ValueError):
+        Scoring(context_bonus_weight=-0.1)
+
+
+def test_scoring_hybrid_weights_roundtrip():
+    # The hybrid/context weights are accepted, surfaced in repr, and participate in equality.
+    scoring = Scoring(dense_weight=0.6, sparse_weight=0.4, context_bonus_weight=0.05)
+    text = repr(scoring)
+    assert "dense_weight=0.6" in text
+    assert "sparse_weight=0.4" in text
+    assert "context_bonus_weight=0.05" in text
+    assert scoring == Scoring(dense_weight=0.6, sparse_weight=0.4, context_bonus_weight=0.05)
+    assert scoring != Scoring(dense_weight=0.7, sparse_weight=0.3, context_bonus_weight=0.05)
+
+
 @pytest.mark.parametrize(
     "backend", OPTIONAL_ONLY_BACKENDS, ids=[b.__name__ for b in OPTIONAL_ONLY_BACKENDS]
 )
