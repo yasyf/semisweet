@@ -20,6 +20,7 @@ use crate::protocol::{
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const POLL_INTERVAL_CAP: Duration = Duration::from_millis(250);
 
 type Conn = Framed<UnixStream, LengthDelimitedCodec>;
 
@@ -112,7 +113,11 @@ fn connect_with_spawn(launcher: &Launcher) -> Result<StdUnixStream> {
 
     spawn_daemon(launcher)?;
 
+    // Back off exponentially (capped) instead of polling at a fixed 25ms: a cold start
+    // settles in a handful of attempts rather than ~1200 connect() syscalls over the
+    // 30s window, while the deadline still bounds the wait.
     let deadline = Instant::now() + SPAWN_TIMEOUT;
+    let mut backoff = POLL_INTERVAL;
     loop {
         if let Some(stream) = try_connect(&socket)? {
             return Ok(stream);
@@ -120,7 +125,8 @@ fn connect_with_spawn(launcher: &Launcher) -> Result<StdUnixStream> {
         if Instant::now() >= deadline {
             return Err(Error::DaemonShutdown);
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(POLL_INTERVAL_CAP);
     }
 }
 
