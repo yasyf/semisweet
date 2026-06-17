@@ -2,7 +2,6 @@
 //! [`fastembed`]. The model downloads once on first construction, then runs offline.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
@@ -18,12 +17,24 @@ const QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant 
 const MODEL_CACHE_ENV: &str = "SEMISWEET_MODEL_CACHE";
 
 pub struct LocalEmbedding {
-    model: Mutex<TextEmbedding>,
+    // Shared, not locked: `TextEmbedding::embed` takes `&self`, so inference-pool workers
+    // embed concurrently through one model. See the `assert_send_sync` invariant below.
+    model: TextEmbedding,
     dim: Dim,
     // The asymmetric query prefix is a BGE/E5-family convention; an explicitly chosen
     // model embeds query and document symmetrically rather than getting a foreign prefix.
     query_instruction: &'static str,
 }
+
+// Concurrent `embed_query` shares one `TextEmbedding` behind `&self`, which requires
+// `LocalEmbedding: Sync`. ort's `unsafe impl Sync for Session` is sound only for the CPU
+// execution provider — it documents a segfault under CUDA/DirectML — and this crate
+// compiles no GPU EP. If a dependency bump or a GPU-EP feature ever flips the model to
+// `!Sync`, this guard fails the build rather than letting the data race ship.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<LocalEmbedding>();
+};
 
 impl LocalEmbedding {
     pub fn new(model: Option<&str>) -> Result<Self> {
@@ -45,18 +56,15 @@ impl LocalEmbedding {
         }
         let model = TextEmbedding::try_new(options).map_err(|e| Error::Embedding(e.into()))?;
         Ok(Self {
-            model: Mutex::new(model),
+            model,
             dim: Dim::new(dim)?,
             query_instruction,
         })
     }
 
     fn embed_one(&self, text: &str) -> Result<Embedding> {
-        let model = self
+        let values = self
             .model
-            .lock()
-            .map_err(|_| Error::Embedding("embedding model mutex poisoned".into()))?;
-        let values = model
             .embed(vec![text], None)
             .map_err(|e| Error::Embedding(e.into()))?
             .pop()
