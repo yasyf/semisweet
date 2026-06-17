@@ -66,7 +66,7 @@ impl WriteJob {
                 return;
             }
         }
-        let result = self.cache.commit(&entry, &self.value);
+        let result = self.cache.commit(entry, &self.value);
         // Drop the shadow once the entry is durable (or the write failed), but only if it
         // still holds OUR value — a set that raced in during the commit keeps its own
         // shadow for its own job. Done after `commit` so a concurrent `get` never sees a

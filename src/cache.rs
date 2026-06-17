@@ -110,7 +110,7 @@ where
         value: &[u8],
     ) -> Result<()> {
         let entry = self.prepare(query, keys, context)?;
-        self.commit(&entry, value)
+        self.commit(entry, value)
     }
 
     /// The slow half of a write — entity extraction + embedding — yielding the entry to
@@ -140,9 +140,9 @@ where
     }
 
     /// The fast half of a write — object put + vector upsert.
-    pub fn commit(&self, entry: &VectorEntry, value: &[u8]) -> Result<()> {
+    pub fn commit(&self, entry: VectorEntry, value: &[u8]) -> Result<()> {
         self.object.put(&self.namespace, &entry.id, value)?;
-        self.vector.upsert(&self.namespace, entry.clone())
+        self.vector.upsert(&self.namespace, entry)
     }
 
     pub fn delete(
