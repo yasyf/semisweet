@@ -16,6 +16,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+// read_frame grows the body buffer one chunk at a time rather than allocating the whole
+// declared length up front, so a peer that announces a large frame but never sends it
+// can't force that allocation before a byte arrives. MAX_FRAME_BYTES still caps the total.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(Uuid);
 
@@ -124,6 +129,17 @@ pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Resul
     Ok(())
 }
 
+fn read_body<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(len.min(READ_CHUNK_BYTES));
+    while body.len() < len {
+        let start = body.len();
+        let want = (len - start).min(READ_CHUNK_BYTES);
+        body.resize(start + want, 0);
+        reader.read_exact(&mut body[start..])?;
+    }
+    Ok(body)
+}
+
 pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
@@ -131,14 +147,13 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
     if len > MAX_FRAME_BYTES {
         return Err(Error::Daemon(format!("frame too large: {len} bytes")));
     }
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
+    let body = read_body(reader, len)?;
     decode(&body)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, ErrorKind};
 
     use super::*;
 
@@ -231,6 +246,38 @@ mod tests {
             let got: Request = read_frame(&mut cursor).unwrap();
             assert_eq!(*expected, got);
         }
+    }
+
+    #[test]
+    fn a_frame_larger_than_a_chunk_round_trips() {
+        // A body spanning several READ_CHUNK_BYTES exercises read_frame's grow-by-chunk loop.
+        let big = Request::Set {
+            namespace: "prod".to_owned(),
+            query: "q".to_owned(),
+            keys: vec![],
+            context: None,
+            value: serde_bytes::ByteBuf::from(vec![0xABu8; READ_CHUNK_BYTES * 3 + 7]),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame(&mut buf, &big).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let got: Request = read_frame(&mut cursor).unwrap();
+        assert_eq!(big, got);
+    }
+
+    #[test]
+    fn read_frame_errors_on_a_truncated_body() {
+        // Header announces 1024 bytes but only 10 follow: the short read must surface as
+        // Error::Io(UnexpectedEof), never a partial frame or a hang.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&1024u32.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 10]);
+        let mut cursor = Cursor::new(buf);
+        let err = read_frame::<_, Request>(&mut cursor).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(ref e) if e.kind() == ErrorKind::UnexpectedEof),
+            "expected Error::Io(UnexpectedEof), got {err:?}"
+        );
     }
 
     #[test]
