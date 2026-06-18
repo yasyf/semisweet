@@ -29,3 +29,4 @@ __pycache__/
 
 # Downloaded model caches (regenerable; fastembed/ONNX weights)
 .fastembed_cache/
+target/
