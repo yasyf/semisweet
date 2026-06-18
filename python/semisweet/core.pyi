@@ -118,20 +118,20 @@ class S3Storage:
     def __hash__(self) -> int: ...
 
 class Scoring:
-    """Frozen, hashable scoring configuration for a namespace."""
+    """Frozen, hashable scoring config: a dense ``threshold``, an entity hard-gate, a
+    lexical ``context_gate``, and a lower ``context_threshold`` dense floor used in place
+    of ``threshold`` when the query carries a ``context`` that clears the gate.
+    """
 
     def __init__(
         self,
         *,
-        base: float | None = None,
-        floor: float | None = None,
-        entity_bonus_weight: float | None = None,
-        dense_weight: float | None = None,
-        sparse_weight: float | None = None,
-        context_bonus_weight: float | None = None,
+        threshold: float | None = None,
         top_k: int | None = None,
         entity_filter: bool | None = None,
         context: str | None = None,
+        context_gate: float | None = None,
+        context_threshold: float | None = None,
     ) -> None: ...
     def __repr__(self) -> str: ...
     def __eq__(self, other: object) -> bool: ...

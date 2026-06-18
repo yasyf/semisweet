@@ -138,7 +138,7 @@ mod tests {
         let keys: BTreeSet<Key> = [Key::new("patient-7".to_owned()).unwrap()]
             .into_iter()
             .collect();
-        EntryId::derive(&query, &keys)
+        EntryId::derive(&query, &keys, &None)
     }
 
     #[test]

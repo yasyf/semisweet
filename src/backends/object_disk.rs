@@ -94,7 +94,7 @@ mod tests {
 
     fn entry_id(query: &str) -> EntryId {
         let q = QueryText::new(query.to_owned()).unwrap();
-        EntryId::derive(&q, &BTreeSet::<Key>::new())
+        EntryId::derive(&q, &BTreeSet::<Key>::new(), &None)
     }
 
     #[test]

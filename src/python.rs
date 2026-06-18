@@ -636,15 +636,17 @@ impl StorageArg<'_> {
 
 /// Frozen, hashable scoring configuration for a namespace.
 ///
-/// Keyword-only args: `base` (float base similarity threshold), `floor` (float minimum
-/// threshold, must be <= base), `entity_bonus_weight` (float >= 0), `top_k` (int > 0),
-/// `entity_filter` (bool), and `context` ('ignore' or 'tiebreak'). Each defaults to the
-/// daemon's default. Raises `ConfigError` if a threshold falls outside [0, 1], `floor`
-/// exceeds `base`, the weight is negative or non-finite, `top_k` is zero, or `context`
-/// is unknown.
+/// Keyword-only args: `threshold` (float dense-cosine accept threshold in [0, 1]),
+/// `top_k` (int > 0), `entity_filter` (bool), `context` ('ignore' or 'gate'),
+/// `context_gate` (float lexical context-overlap threshold in [0, 1], applied as a hard
+/// gate when the query carries a context), and `context_threshold` (float dense floor in
+/// [0, 1], `<= threshold`, used in place of `threshold` when the query carries a context
+/// that clears the gate). Each defaults to the daemon's default. Raises `ConfigError` if a
+/// threshold falls outside [0, 1], `context_threshold` exceeds `threshold`, `top_k` is
+/// zero, or `context` is unknown.
 ///
-/// Equality compares the float thresholds with `==`; `__hash__` deliberately excludes
-/// them and hashes only `top_k`, `entity_filter`, and `context`, so equal objects
+/// Equality compares every field with `==`; `__hash__` deliberately excludes the float
+/// thresholds and hashes only `top_k`, `entity_filter`, and `context`, so equal objects
 /// always hash equal despite float comparison subtleties.
 #[pyclass(name = "Scoring", frozen)]
 pub(crate) struct PyScoring {
@@ -654,30 +656,23 @@ pub(crate) struct PyScoring {
 #[pymethods]
 impl PyScoring {
     #[new]
-    #[pyo3(signature = (*, base = None, floor = None, entity_bonus_weight = None, dense_weight = None, sparse_weight = None, context_bonus_weight = None, top_k = None, entity_filter = None, context = None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, threshold = None, top_k = None, entity_filter = None, context = None, context_gate = None, context_threshold = None))]
     fn new(
-        base: Option<f32>,
-        floor: Option<f32>,
-        entity_bonus_weight: Option<f32>,
-        dense_weight: Option<f32>,
-        sparse_weight: Option<f32>,
-        context_bonus_weight: Option<f32>,
+        threshold: Option<f32>,
         top_k: Option<usize>,
         entity_filter: Option<bool>,
         context: Option<String>,
+        context_gate: Option<f32>,
+        context_threshold: Option<f32>,
     ) -> Result<Self> {
         let defaults = ScoringDto::default();
         let dto = ScoringDto {
-            base_threshold: base.unwrap_or(defaults.base_threshold),
-            floor_threshold: floor.unwrap_or(defaults.floor_threshold),
-            entity_bonus_weight: entity_bonus_weight.unwrap_or(defaults.entity_bonus_weight),
-            dense_weight: dense_weight.unwrap_or(defaults.dense_weight),
-            sparse_weight: sparse_weight.unwrap_or(defaults.sparse_weight),
-            context_bonus_weight: context_bonus_weight.unwrap_or(defaults.context_bonus_weight),
-            top_k: top_k.unwrap_or(defaults.top_k),
+            threshold: threshold.unwrap_or(defaults.threshold),
             entity_filter: entity_filter.unwrap_or(defaults.entity_filter),
             context: context.unwrap_or(defaults.context),
+            context_gate: context_gate.unwrap_or(defaults.context_gate),
+            context_threshold: context_threshold.unwrap_or(defaults.context_threshold),
+            top_k: top_k.unwrap_or(defaults.top_k),
         };
         // Validate eagerly so a bad threshold fails at construction, not at first use.
         dto.to_config()?;
@@ -687,13 +682,10 @@ impl PyScoring {
     /// Render every configured scoring field.
     fn __repr__(&self) -> String {
         format!(
-            "Scoring(base={}, floor={}, entity_bonus_weight={}, dense_weight={}, sparse_weight={}, context_bonus_weight={}, top_k={}, entity_filter={}, context='{}')",
-            self.dto.base_threshold,
-            self.dto.floor_threshold,
-            self.dto.entity_bonus_weight,
-            self.dto.dense_weight,
-            self.dto.sparse_weight,
-            self.dto.context_bonus_weight,
+            "Scoring(threshold={}, context_gate={}, context_threshold={}, top_k={}, entity_filter={}, context='{}')",
+            self.dto.threshold,
+            self.dto.context_gate,
+            self.dto.context_threshold,
             self.dto.top_k,
             py_bool(self.dto.entity_filter),
             self.dto.context

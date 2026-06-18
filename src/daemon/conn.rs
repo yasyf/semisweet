@@ -218,7 +218,7 @@ async fn handle_get(
     };
     // Read-after-write: an in-flight `set` for this exact entry is served straight
     // from the pending shadow, before (and instead of) the embed + vector-search path.
-    let id = EntryId::derive(&query, &keys);
+    let id = EntryId::derive(&query, &keys, &context);
     match entry.pending.get(&id) {
         Ok(Some(value)) => {
             return Response::Value(Some(serde_bytes::ByteBuf::from(value.to_vec())));
@@ -253,7 +253,7 @@ fn handle_set(
         Ok(parts) => parts,
         Err(response) => return response,
     };
-    let id = EntryId::derive(&query, &keys);
+    let id = EntryId::derive(&query, &keys, &context);
     let value: Arc<[u8]> = Arc::from(value);
     // Record the shadow before enqueueing: were the order reversed, a worker could run
     // and remove the (not-yet-inserted) id, leaking the value into the buffer forever.
@@ -302,7 +302,7 @@ async fn handle_del(
     // longer `holds` its value); a delete that races in mid-commit is not ordered against
     // the write, so that one entry can still land durably — an accepted bound of the
     // lock-free write-behind, not a guarantee.
-    let id = EntryId::derive(&query, &keys);
+    let id = EntryId::derive(&query, &keys, &context);
     let removed_pending = match entry.pending.remove(&id) {
         Ok(removed) => removed,
         Err(error) => return backend_error(error),

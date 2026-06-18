@@ -50,33 +50,53 @@ def test_cache_query_rejects_positional_args():
         CacheQuery("what is the capital of france")
 
 
-def test_scoring_floor_above_base_raises():
-    # floor > base is rejected eagerly in the Scoring constructor, no daemon involved.
+def test_scoring_threshold_out_of_range_raises():
+    # A threshold outside [0, 1] is rejected eagerly in the Scoring constructor, no daemon.
     with pytest.raises(ValueError):
-        Scoring(base=0.90, floor=0.95)
+        Scoring(threshold=1.5)
 
 
-def test_scoring_zero_hybrid_weights_raises():
-    # dense_weight + sparse_weight must be > 0, else the fused score divides by zero. Rejected
-    # eagerly in the constructor.
+def test_scoring_context_gate_out_of_range_raises():
+    # The context gate is a Jaccard overlap in [0, 1]; out-of-range is rejected eagerly.
     with pytest.raises(ValueError):
-        Scoring(dense_weight=0.0, sparse_weight=0.0)
+        Scoring(context_gate=1.5)
 
 
-def test_scoring_negative_weight_raises():
+def test_scoring_unknown_context_mode_raises():
     with pytest.raises(ValueError):
-        Scoring(context_bonus_weight=-0.1)
+        Scoring(context="bogus")
 
 
-def test_scoring_hybrid_weights_roundtrip():
-    # The hybrid/context weights are accepted, surfaced in repr, and participate in equality.
-    scoring = Scoring(dense_weight=0.6, sparse_weight=0.4, context_bonus_weight=0.05)
+def test_scoring_context_threshold_above_threshold_raises():
+    # The context-present dense floor must not exceed the full threshold; an inverted pair
+    # is rejected eagerly in the Scoring constructor, no daemon.
+    with pytest.raises(ValueError):
+        Scoring(threshold=0.8, context_threshold=0.9)
+
+
+def test_scoring_fields_roundtrip():
+    # The scoring knobs are accepted, surfaced in repr, and participate in equality.
+    scoring = Scoring(
+        threshold=0.8, context_gate=0.25, context_threshold=0.7, context="gate"
+    )
     text = repr(scoring)
-    assert "dense_weight=0.6" in text
-    assert "sparse_weight=0.4" in text
-    assert "context_bonus_weight=0.05" in text
-    assert scoring == Scoring(dense_weight=0.6, sparse_weight=0.4, context_bonus_weight=0.05)
-    assert scoring != Scoring(dense_weight=0.7, sparse_weight=0.3, context_bonus_weight=0.05)
+    assert "threshold=0.8" in text
+    assert "context_gate=0.25" in text
+    assert "context_threshold=0.7" in text
+    assert "context='gate'" in text
+    assert scoring == Scoring(
+        threshold=0.8, context_gate=0.25, context_threshold=0.7, context="gate"
+    )
+    assert scoring != Scoring(
+        threshold=0.9, context_gate=0.25, context_threshold=0.7, context="gate"
+    )
+
+
+def test_memory_vectors_is_a_bare_config_object():
+    # MemoryVectors takes no arguments: a stable no-arg repr and all instances compare equal.
+    vectors = MemoryVectors()
+    assert repr(vectors) == "MemoryVectors()"
+    assert vectors == MemoryVectors()
 
 
 @pytest.mark.parametrize(

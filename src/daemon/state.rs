@@ -136,10 +136,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::newtype::QueryText;
+    use crate::newtype::{Context, QueryText};
 
     fn id(query: &str) -> EntryId {
-        EntryId::derive(&QueryText::new(query.to_owned()).unwrap(), &BTreeSet::new())
+        EntryId::derive(
+            &QueryText::new(query.to_owned()).unwrap(),
+            &BTreeSet::new(),
+            &None,
+        )
     }
 
     #[test]
@@ -219,6 +223,36 @@ mod tests {
         assert_eq!(pending.get(&a).unwrap().as_deref(), Some(&[0xAA][..]));
         pending.remove(&a).unwrap();
         assert!(pending.get(&a).unwrap().is_none());
+        assert_eq!(pending.get(&b).unwrap().as_deref(), Some(&[0xBB][..]));
+    }
+
+    #[test]
+    fn pending_shadow_isolates_context_variants() {
+        let pending = PendingWrites::default();
+        let query = QueryText::new("what is the dose".to_owned()).unwrap();
+        let keys = BTreeSet::new();
+        let a = EntryId::derive(
+            &query,
+            &keys,
+            &Some(Context::new("oncology".to_owned()).unwrap()),
+        );
+        let b = EntryId::derive(
+            &query,
+            &keys,
+            &Some(Context::new("cardiology".to_owned()).unwrap()),
+        );
+        assert_ne!(
+            a, b,
+            "same query and keys with different context must derive distinct ids"
+        );
+
+        pending.insert(a, Arc::from(vec![0xAA])).unwrap();
+        pending.insert(b, Arc::from(vec![0xBB])).unwrap();
+        pending.remove(&a).unwrap();
+        assert!(
+            pending.get(&a).unwrap().is_none(),
+            "removing one context variant leaves the other shadow intact"
+        );
         assert_eq!(pending.get(&b).unwrap().as_deref(), Some(&[0xBB][..]));
     }
 }

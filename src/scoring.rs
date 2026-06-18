@@ -1,186 +1,127 @@
+//! Scoring: deciding when a candidate entry is a semantic hit.
+//!
+//! A cache miss is cheap (recompute), but a *false hit* returns a wrong cached answer — so the
+//! model is precision-first and built entirely from HARD gates, never score fusion or a soft
+//! threshold relaxation. A candidate is accepted only if it clears, in order:
+//!
+//! 1. **Entity hard-gate** — when the query carries `n` entities, at least `max(1, n/3)` must
+//!    overlap the candidate's. Rejects same-template / different-subject neighbors.
+//! 2. **Context hard-gate** (`Gate` mode, context-bearing query) — the candidate's backend
+//!    context-BM25 match (`hit.sparse_score`, the query context scored against the stored
+//!    context) must reach `context_gate`, else reject. This is the sole disambiguator between
+//!    entries that share a query but differ in context.
+//! 3. **Dense floor** — the query/candidate cosine must clear a threshold. A context-bearing
+//!    query that passed the context gate is already precision-backstopped, so it need only
+//!    reach the lower `context_threshold`; everything else must reach the full `threshold`.
+//!
+//! Entry identity (`EntryId`, see [`crate::newtype`]) includes `context`, so the same query and
+//! keys with a different context are *distinct* entries the context gate disambiguates, rather
+//! than one overwriting the other. Defaults are calibrated precision-first on representative
+//! bench data (see `bench/`).
+
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use crate::error::Result;
-use crate::newtype::{Context, Embedding, Entity};
+use crate::newtype::{Context, Entity};
 use crate::vector::ScoredHit;
 
-// Thresholds and bonuses live on the *fused* score scale. A pure-dense hit (sparse 0) fuses to
-// `dense_weight * cosine`, so scaling the original pure-dense cosine thresholds by the default
-// `dense_weight` of 0.7 (0.90 -> 0.63, 0.86 -> 0.602, 0.04 -> 0.028) makes hybrid an exact superset
-// of pure-dense matching: with sparse 0 the accept decision is identical to the old cosine gate
-// (`cosine >= 0.90 - 0.04*entity_ratio`, floored at 0.86), and any lexical or context signal only
-// ever lowers the bar further. Setting `dense_weight` away from 0.7 rescales this relationship.
-const DEFAULT_BASE_THRESHOLD: f32 = 0.63;
-const DEFAULT_FLOOR_THRESHOLD: f32 = 0.602;
-const DEFAULT_ENTITY_BONUS_WEIGHT: f32 = 0.028;
-const DEFAULT_DENSE_WEIGHT: f32 = 0.7;
-const DEFAULT_SPARSE_WEIGHT: f32 = 0.3;
-const DEFAULT_CONTEXT_BONUS_WEIGHT: f32 = 0.028;
+// Defaults calibrated on representative v3 bench data (Phase C), precision-first. Tests
+// derive expected behavior from the config's own fields rather than these literals.
+const DEFAULT_THRESHOLD: f32 = 0.92;
+// Locked on v3 via the daemon: wrong-context BM25 tops out ~0.05 and correct contexts start
+// ~0.13, so 0.10 sits in the gap — 0 wrong-entry, 29/36 disambiguation (matching Jaccard).
+const DEFAULT_CONTEXT_GATE: f32 = 0.10;
+const DEFAULT_CONTEXT_THRESHOLD: f32 = 0.88;
 const DEFAULT_TOP_K: NonZeroUsize = match NonZeroUsize::new(10) {
     Some(top_k) => top_k,
     None => unreachable!(),
 };
-const TIE_EPSILON: f32 = 1e-6;
-
-fn token_set(text: &str) -> BTreeSet<&str> {
-    text.split_whitespace().collect()
-}
-
-/// Lexical overlap of two token sets in `[0, 1]` (Jaccard). Disjoint or empty -> 0.
-fn jaccard(a: &BTreeSet<&str>, b: &BTreeSet<&str>) -> f32 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.union(b).count();
-    intersection as f32 / union as f32
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMode {
     Ignore,
-    Tiebreak,
+    Gate,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScoringConfig {
-    pub base_threshold: f32,
-    pub floor_threshold: f32,
-    pub entity_bonus_weight: f32,
-    pub dense_weight: f32,
-    pub sparse_weight: f32,
-    pub context_bonus_weight: f32,
-    pub top_k: NonZeroUsize,
+    pub threshold: f32,
     pub entity_filter: bool,
     pub context: ContextMode,
+    pub context_gate: f32,
+    pub context_threshold: f32,
+    pub top_k: NonZeroUsize,
 }
 
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
-            base_threshold: DEFAULT_BASE_THRESHOLD,
-            floor_threshold: DEFAULT_FLOOR_THRESHOLD,
-            entity_bonus_weight: DEFAULT_ENTITY_BONUS_WEIGHT,
-            dense_weight: DEFAULT_DENSE_WEIGHT,
-            sparse_weight: DEFAULT_SPARSE_WEIGHT,
-            context_bonus_weight: DEFAULT_CONTEXT_BONUS_WEIGHT,
-            top_k: DEFAULT_TOP_K,
+            threshold: DEFAULT_THRESHOLD,
             entity_filter: true,
-            context: ContextMode::Tiebreak,
+            context: ContextMode::Gate,
+            context_gate: DEFAULT_CONTEXT_GATE,
+            context_threshold: DEFAULT_CONTEXT_THRESHOLD,
+            top_k: DEFAULT_TOP_K,
         }
     }
 }
 
 impl ScoringConfig {
-    /// Whether the read path should embed the query context for the dense half of the context
-    /// boost. False when context is ignored or either weight zeroes the dense context term out,
-    /// so the extra embedding call on a context-bearing GET is skipped.
-    pub fn uses_context_dense(&self) -> bool {
-        self.context != ContextMode::Ignore
-            && self.context_bonus_weight > 0.0
-            && self.dense_weight > 0.0
-    }
-
-    /// Convex combination of a dense cosine (already in `[0, 1]`) and a backend-normalized
-    /// sparse score (in `[0, 1]`). Normalizing by the weight sum keeps the result in `[0, 1]`
-    /// and makes `sparse_weight == 0` reduce exactly to the dense score. The caller guarantees
-    /// `dense_weight + sparse_weight > 0` (validated in `ScoringDto::to_config`).
-    fn fuse(&self, dense: f32, sparse: f32) -> f32 {
-        (self.dense_weight * dense.clamp(0.0, 1.0) + self.sparse_weight * sparse.clamp(0.0, 1.0))
-            / (self.dense_weight + self.sparse_weight)
-    }
-
-    /// The bioqa-style context boost: a present, matching query context lowers the effective
-    /// threshold by up to `context_bonus_weight`. Absent context (or `ContextMode::Ignore`)
-    /// yields 0 — it never penalizes. The match itself is hybrid: dense cosine of the context
-    /// embeddings fused with the lexical overlap of the context text.
-    fn context_relaxation(
-        &self,
-        query_context: &Option<Context>,
-        query_context_vector: &Option<Embedding>,
-        hit: &ScoredHit,
-    ) -> Result<f32> {
-        let Some(query_context) = query_context else {
-            return Ok(0.0);
-        };
-        if self.context == ContextMode::Ignore {
-            return Ok(0.0);
-        }
-        let sparse_c = match &hit.context {
-            Some(hit_context) => jaccard(
-                &token_set(query_context.as_str()),
-                &token_set(hit_context.as_str()),
-            ),
-            None => 0.0,
-        };
-        let dense_c = match (query_context_vector, &hit.context_vector) {
-            (Some(query_vector), Some(hit_vector)) => query_vector.dot(hit_vector)?.clamp(0.0, 1.0),
-            _ => 0.0,
-        };
-        Ok(self.context_bonus_weight * self.fuse(dense_c, sparse_c))
-    }
-
+    /// Accept a candidate through the entity hard-gate and a context-selected dense floor.
+    /// First, when the query carries entities, at least `max(1, n/3)` of its `n` entities
+    /// must overlap the hit's. Then the dense floor: in `Gate` mode a context-bearing query
+    /// whose candidate context-BM25 match (`hit.sparse_score`) clears `context_gate` is
+    /// backstopped on precision, so its dense cosine need only reach the lower
+    /// `context_threshold`; a candidate that misses the gate is rejected outright. A
+    /// context-less query, or `Ignore` mode, must reach the full `threshold`.
     fn accept(
         &self,
         query_entities: &BTreeSet<Entity>,
         query_context: &Option<Context>,
-        query_context_vector: &Option<Embedding>,
         hit: &ScoredHit,
     ) -> Result<bool> {
         let n = query_entities.len();
-        let overlap = query_entities.intersection(&hit.entities).count();
         if n > 0 {
             let required = (n / 3).max(1);
-            if overlap < required {
+            if query_entities.intersection(&hit.entities).count() < required {
                 return Ok(false);
             }
         }
-        let ratio = if n == 0 {
-            0.0
-        } else {
-            overlap as f32 / n as f32
+        let dense_floor = match (self.context, query_context) {
+            (ContextMode::Gate, Some(_)) => {
+                if hit.sparse_score < self.context_gate {
+                    return Ok(false);
+                }
+                self.context_threshold
+            }
+            _ => self.threshold,
         };
-        let tau_eff = (self.base_threshold
-            - self.entity_bonus_weight * ratio
-            - self.context_relaxation(query_context, query_context_vector, hit)?)
-        .clamp(self.floor_threshold, self.base_threshold);
-        Ok(self.fuse(hit.dense_score, hit.sparse_score) >= tau_eff)
+        Ok(hit.dense_score >= dense_floor)
     }
 
+    /// The accepted candidate with the highest dense cosine, or `None` when every hit is
+    /// filtered out. An exact dense-score tie keeps the first hit in `hits` order.
     pub fn select(
         &self,
         query_entities: &BTreeSet<Entity>,
         query_context: &Option<Context>,
-        query_context_vector: &Option<Embedding>,
         hits: Vec<ScoredHit>,
     ) -> Result<Option<ScoredHit>> {
-        // (hit, fused query score, context relaxation) — the relaxation doubles as the
-        // continuous tiebreaker among near-equal fused scores.
-        let mut scored: Vec<(ScoredHit, f32, f32)> = Vec::with_capacity(hits.len());
+        let mut best: Option<ScoredHit> = None;
         for hit in hits {
-            if !self.accept(query_entities, query_context, query_context_vector, &hit)? {
+            if !self.accept(query_entities, query_context, &hit)? {
                 continue;
             }
-            let fused = self.fuse(hit.dense_score, hit.sparse_score);
-            let relaxation = self.context_relaxation(query_context, query_context_vector, &hit)?;
-            scored.push((hit, fused, relaxation));
+            let wins = match &best {
+                Some(current) => hit.dense_score.total_cmp(&current.dense_score).is_gt(),
+                None => true,
+            };
+            if wins {
+                best = Some(hit);
+            }
         }
-        let Some(best_fused) = scored
-            .iter()
-            .map(|(_, fused, _)| *fused)
-            .max_by(f32::total_cmp)
-        else {
-            return Ok(None);
-        };
-        let winner = scored
-            .into_iter()
-            .filter(|(_, fused, _)| (best_fused - fused).abs() <= TIE_EPSILON)
-            .max_by(|(_, fused_a, relax_a), (_, fused_b, relax_b)| {
-                relax_a.total_cmp(relax_b).then(fused_a.total_cmp(fused_b))
-            })
-            .map(|(hit, _, _)| hit);
-        Ok(winner)
+        Ok(best)
     }
 }
 
@@ -188,10 +129,11 @@ impl ScoringConfig {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::error::Error;
-    use crate::newtype::{Context, Embedding, Entity, EntryId, Key, QueryText};
+    use crate::newtype::{Context, Entity, EntryId, Key, QueryText};
 
     use super::*;
+
+    const EPS: f32 = 1e-3;
 
     fn ents(names: &[&str]) -> BTreeSet<Entity> {
         names
@@ -200,313 +142,294 @@ mod tests {
             .collect()
     }
 
-    fn hit(
-        label: &str,
-        dense: f32,
-        sparse: f32,
-        entities: BTreeSet<Entity>,
-        context: Option<&str>,
-        context_vector: Option<Embedding>,
-    ) -> ScoredHit {
+    fn ctx(text: &str) -> Option<Context> {
+        Some(Context::new(text.to_owned()).unwrap())
+    }
+
+    fn hit(label: &str, dense: f32, entities: BTreeSet<Entity>, sparse: f32) -> ScoredHit {
         let id = EntryId::derive(
             &QueryText::new(label.to_owned()).unwrap(),
             &BTreeSet::<Key>::new(),
+            &None,
         );
         ScoredHit {
             id,
             dense_score: dense,
             sparse_score: sparse,
             entities,
-            context: context.map(|c| Context::new(c.to_owned()).unwrap()),
-            context_vector,
+            context: None,
         }
     }
 
-    /// A hit whose fused query score equals `score` (dense == sparse) and carries no context
-    /// vector — the common case for the entity-gate and threshold tests.
-    fn make_hit(
-        label: &str,
-        score: f32,
-        entities: BTreeSet<Entity>,
-        context: Option<&str>,
-    ) -> ScoredHit {
-        hit(label, score, score, entities, context, None)
+    /// A dense cosine comfortably above `threshold`, so a test isolates the entity or
+    /// context gate rather than the dense gate.
+    fn clears_dense(config: &ScoringConfig) -> f32 {
+        (config.threshold + 1.0) / 2.0
     }
 
-    fn accepts(config: &ScoringConfig, query: &BTreeSet<Entity>, hit: &ScoredHit) -> bool {
-        config.accept(query, &None, &None, hit).unwrap()
+    /// A context-BM25 match comfortably above `context_gate`, so a test isolates the dense
+    /// floor rather than the context gate.
+    fn clears_gate(config: &ScoringConfig) -> f32 {
+        (config.context_gate + 1.0) / 2.0
     }
+
+    fn accepts(
+        config: &ScoringConfig,
+        query_entities: &BTreeSet<Entity>,
+        query_context: &Option<Context>,
+        hit: &ScoredHit,
+    ) -> bool {
+        config.accept(query_entities, query_context, hit).unwrap()
+    }
+
+    // --- entity hard-gate ---
 
     #[test]
     fn entity_gate_boundary_n2_requires_one() {
         let config = ScoringConfig::default();
+        let d = clears_dense(&config);
         let query = ents(&["a", "b"]);
-        let below = make_hit("h", 0.99, ents(&["c"]), None);
-        let at = make_hit("h", 0.99, ents(&["a"]), None);
-        assert!(!accepts(&config, &query, &below));
-        assert!(accepts(&config, &query, &at));
+        let below = hit("h", d, ents(&["c"]), 0.0);
+        let at = hit("h", d, ents(&["a"]), 0.0);
+        assert!(!accepts(&config, &query, &None, &below));
+        assert!(accepts(&config, &query, &None, &at));
     }
 
     #[test]
     fn entity_gate_boundary_n3_requires_one() {
         let config = ScoringConfig::default();
+        let d = clears_dense(&config);
         let query = ents(&["a", "b", "c"]);
-        let below = make_hit("h", 0.99, ents(&["x"]), None);
-        let at = make_hit("h", 0.99, ents(&["b"]), None);
-        assert!(!accepts(&config, &query, &below));
-        assert!(accepts(&config, &query, &at));
+        let below = hit("h", d, ents(&["x"]), 0.0);
+        let at = hit("h", d, ents(&["b"]), 0.0);
+        assert!(!accepts(&config, &query, &None, &below));
+        assert!(accepts(&config, &query, &None, &at));
     }
 
     #[test]
     fn entity_gate_boundary_n5_requires_one() {
         let config = ScoringConfig::default();
+        let d = clears_dense(&config);
         let query = ents(&["a", "b", "c", "d", "e"]);
-        let below = make_hit("h", 0.99, ents(&["x", "y"]), None);
-        let at = make_hit("h", 0.99, ents(&["c"]), None);
-        assert!(!accepts(&config, &query, &below));
-        assert!(accepts(&config, &query, &at));
+        let below = hit("h", d, ents(&["x", "y"]), 0.0);
+        let at = hit("h", d, ents(&["c"]), 0.0);
+        assert!(!accepts(&config, &query, &None, &below));
+        assert!(accepts(&config, &query, &None, &at));
     }
 
     #[test]
     fn entity_gate_boundary_n6_requires_two() {
         let config = ScoringConfig::default();
+        let d = clears_dense(&config);
         let query = ents(&["a", "b", "c", "d", "e", "f"]);
-        let below = make_hit("h", 0.99, ents(&["a"]), None);
-        let at = make_hit("h", 0.99, ents(&["a", "b"]), None);
-        assert!(!accepts(&config, &query, &below));
-        assert!(accepts(&config, &query, &at));
+        let below = hit("h", d, ents(&["a"]), 0.0);
+        let at = hit("h", d, ents(&["a", "b"]), 0.0);
+        assert!(!accepts(&config, &query, &None, &below));
+        assert!(accepts(&config, &query, &None, &at));
     }
 
     #[test]
-    fn bonus_relaxes_threshold_with_full_overlap() {
-        // Full entity overlap drops tau_eff from base 0.63 to the floor 0.602; a fused 0.61 hit is
-        // below base but above the relaxed bar, so it only accepts because of the relaxation.
+    fn entity_overlap_does_not_rescue_subthreshold_dense() {
+        // The entity gate only filters — the removed entity_bonus no longer relaxes the
+        // dense bar, so a sub-threshold hit with full overlap is still rejected.
         let config = ScoringConfig::default();
         let query = ents(&["a"]);
-        let full = make_hit("h", 0.61, ents(&["a"]), None);
-        let none = make_hit("h", 0.61, BTreeSet::new(), None);
-        assert!(accepts(&config, &query, &full));
-        assert!(!accepts(&config, &BTreeSet::new(), &none));
+        let candidate = hit("h", config.threshold - EPS, ents(&["a"]), 0.0);
+        assert!(!accepts(&config, &query, &None, &candidate));
     }
 
+    // --- dense gate ---
+
     #[test]
-    fn bonus_does_not_save_no_overlap() {
+    fn dense_gate_accepts_at_threshold_rejects_below() {
         let config = ScoringConfig::default();
-        let query = ents(&["a"]);
-        let none = make_hit("h", 0.61, ents(&["b"]), None);
-        assert!(!accepts(&config, &query, &none));
+        let no_entities = BTreeSet::<Entity>::new();
+        let at = hit("h", config.threshold, BTreeSet::new(), 0.0);
+        let below = hit("h", config.threshold - EPS, BTreeSet::new(), 0.0);
+        assert!(accepts(&config, &no_entities, &None, &at));
+        assert!(!accepts(&config, &no_entities, &None, &below));
     }
 
+    // --- context hard-gate ---
+
     #[test]
-    fn full_overlap_still_rejects_below_floor() {
+    fn context_gate_accepts_matching_context() {
+        // The backend reports a context match clearing the gate; with the dense floor cleared
+        // too, the candidate is accepted.
         let config = ScoringConfig::default();
-        let query = ents(&["a"]);
-        let low = make_hit("h", 0.59, ents(&["a"]), None);
-        assert!(!accepts(&config, &query, &low));
+        let d = clears_dense(&config);
+        let candidate = hit("h", d, BTreeSet::new(), clears_gate(&config));
+        assert!(accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
     }
 
     #[test]
-    fn partial_overlap_relaxes_only_partially() {
-        // 1/3 entity overlap relaxes tau_eff only to ~0.621; a fused 0.61 hit stays below it,
-        // though full overlap (tau_eff 0.602) would have accepted it.
+    fn context_gate_rejects_below_gate_match() {
         let config = ScoringConfig::default();
-        let query = ents(&["a", "b", "c"]);
-        let partial = make_hit("h", 0.61, ents(&["a"]), None);
-        assert!(!accepts(&config, &query, &partial));
+        assert!(config.context_gate > 0.0);
+        let d = clears_dense(&config);
+        let candidate = hit("h", d, BTreeSet::new(), config.context_gate - EPS);
+        assert!(!accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
     }
 
     #[test]
-    fn weight_zero_reduces_to_bioqa() {
-        // Zeroing every relaxation/sparse weight and restoring the old band reproduces the
-        // pure-dense threshold gate: fuse() collapses to the dense score.
+    fn context_gate_rejects_candidate_without_context() {
+        // The query carries a context; the candidate stored none -> backend match 0 -> reject.
+        let config = ScoringConfig::default();
+        assert!(config.context_gate > 0.0);
+        let d = clears_dense(&config);
+        let candidate = hit("h", d, BTreeSet::new(), 0.0);
+        assert!(!accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
+    }
+
+    #[test]
+    fn context_gate_skipped_without_query_context() {
+        // A context-less query is never rejected by the context gate, even in Gate mode and
+        // even when the candidate's context match is 0.
+        let config = ScoringConfig::default();
+        let d = clears_dense(&config);
+        let candidate = hit("h", d, BTreeSet::new(), 0.0);
+        assert!(accepts(&config, &BTreeSet::new(), &None, &candidate));
+    }
+
+    #[test]
+    fn context_gate_skipped_in_ignore_mode() {
         let config = ScoringConfig {
-            entity_bonus_weight: 0.0,
-            sparse_weight: 0.0,
-            context_bonus_weight: 0.0,
-            base_threshold: 0.90,
-            floor_threshold: 0.86,
+            context: ContextMode::Ignore,
             ..ScoringConfig::default()
         };
-        let query = ents(&["a", "b"]);
-        let above_gate_above_thresh = make_hit("h", 0.91, ents(&["a", "b"]), None);
-        let above_gate_below_thresh = make_hit("h", 0.89, ents(&["a", "b"]), None);
-        let below_gate = make_hit("h", 0.99, ents(&["x"]), None);
-        assert!(accepts(&config, &query, &above_gate_above_thresh));
-        assert!(!accepts(&config, &query, &above_gate_below_thresh));
-        assert!(!accepts(&config, &query, &below_gate));
+        let d = clears_dense(&config);
+        let candidate = hit("h", d, BTreeSet::new(), 0.0);
+        assert!(accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
     }
 
     #[test]
-    fn base_threshold_with_no_entities() {
+    fn context_gate_is_inclusive_at_the_bar() {
+        // The reject is strict `<`, so a context match exactly equal to the gate is accepted
+        // and a strictly smaller one is rejected.
         let config = ScoringConfig::default();
-        let query = BTreeSet::<Entity>::new();
-        let above = make_hit("h", 0.66, BTreeSet::new(), None);
-        let below = make_hit("h", 0.60, BTreeSet::new(), None);
-        assert!(accepts(&config, &query, &above));
-        assert!(!accepts(&config, &query, &below));
+        let d = clears_dense(&config);
+        let at = hit("h", d, BTreeSet::new(), config.context_gate);
+        assert!(accepts(&config, &BTreeSet::new(), &ctx("q"), &at));
+        let below = hit("h", d, BTreeSet::new(), config.context_gate - EPS);
+        assert!(!accepts(&config, &BTreeSet::new(), &ctx("q"), &below));
     }
 
     #[test]
-    fn fuse_is_convex_combination_in_unit_range() {
+    fn context_match_does_not_rescue_below_context_threshold() {
+        // A matching context lowers the dense floor to `context_threshold`, but never below
+        // it: a hit under that floor with a clearing context match is still rejected.
         let config = ScoringConfig::default();
-        assert!(config.fuse(0.0, 0.0).abs() < 1e-6);
-        assert!((config.fuse(1.0, 1.0) - 1.0).abs() < 1e-6);
-        assert!((config.fuse(1.0, 0.0) - 0.7).abs() < 1e-6);
-        assert!((config.fuse(0.0, 1.0) - 0.3).abs() < 1e-6);
-    }
-
-    #[test]
-    fn sparse_weight_zero_reduces_fuse_to_dense() {
-        let config = ScoringConfig {
-            sparse_weight: 0.0,
-            ..ScoringConfig::default()
-        };
-        assert!((config.fuse(0.9, 0.1) - 0.9).abs() < 1e-6);
-        assert!((config.fuse(0.3, 1.0) - 0.3).abs() < 1e-6);
-    }
-
-    #[test]
-    fn context_relaxation_rescues_subthreshold_hit() {
-        // A fused 0.61 hit is below base 0.63, so it misses on its own. A perfectly matching
-        // present context (dense_c == sparse_c == 1.0) relaxes tau_eff to the floor 0.602 and
-        // rescues it.
-        let config = ScoringConfig::default();
-        let vector = Embedding::new(vec![1.0, 0.0, 0.0]).unwrap();
         let candidate = hit(
             "h",
-            0.61,
-            0.61,
+            config.context_threshold - EPS,
             BTreeSet::new(),
-            Some("alpha beta"),
-            Some(vector.clone()),
+            clears_gate(&config),
         );
-        let query_context = Some(Context::new("alpha beta".to_owned()).unwrap());
-
-        assert!(
-            config
-                .accept(&BTreeSet::new(), &query_context, &Some(vector), &candidate)
-                .unwrap()
-        );
-        assert!(!accepts(&config, &BTreeSet::new(), &candidate));
+        assert!(!accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
     }
+
+    // --- context-present dense floor ---
 
     #[test]
-    fn present_query_context_with_absent_hit_context_is_no_penalty() {
-        // The query carries a context, but the candidate stored none: relaxation is 0, so the
-        // decision matches the no-context case exactly — never a penalty.
+    fn context_present_uses_lower_dense_floor() {
+        // A context match clearing the gate drops the dense floor from `threshold` to the
+        // lower `context_threshold`, so a dense score between the two clears the floor only
+        // when the query actually carries a context.
         let config = ScoringConfig::default();
-        let vector = Embedding::new(vec![1.0, 0.0, 0.0]).unwrap();
-        let query_context = Some(Context::new("alpha beta".to_owned()).unwrap());
+        assert!(config.context_threshold < config.threshold);
+        let between = (config.context_threshold + config.threshold) / 2.0;
+        let candidate = hit("h", between, BTreeSet::new(), clears_gate(&config));
 
-        let on_its_own = make_hit("h", 0.66, BTreeSet::new(), None);
-        let too_low = make_hit("h", 0.60, BTreeSet::new(), None);
-        assert!(
-            config
-                .accept(
-                    &BTreeSet::new(),
-                    &query_context,
-                    &Some(vector.clone()),
-                    &on_its_own,
-                )
-                .unwrap()
-        );
-        assert!(
-            !config
-                .accept(&BTreeSet::new(), &query_context, &Some(vector), &too_low)
-                .unwrap()
-        );
+        // Context-bearing query + a context match clearing the gate: the lower floor applies,
+        // so a sub-`threshold` dense is accepted.
+        assert!(accepts(&config, &BTreeSet::new(), &ctx("q"), &candidate));
+
+        // Same hit and dense, but a context-less query: the full `threshold` applies and
+        // rejects.
+        assert!(!accepts(&config, &BTreeSet::new(), &None, &candidate));
+
+        // Context-bearing but the candidate's match misses the gate: the hard-gate rejects
+        // regardless of dense — even a perfect 1.0.
+        let mismatched = hit("h", 1.0, BTreeSet::new(), config.context_gate - EPS);
+        assert!(!accepts(&config, &BTreeSet::new(), &ctx("q"), &mismatched));
     }
 
-    #[test]
-    fn dim_mismatch_context_vector_errors() {
-        // The context cosine is fail-fast: a stored context vector whose dimension differs from
-        // the query context embedding surfaces DimMismatch rather than coercing to 0.
-        let config = ScoringConfig::default();
-        let query_vector = Embedding::new(vec![1.0, 0.0, 0.0]).unwrap();
-        let hit_vector = Embedding::new(vec![1.0, 0.0]).unwrap();
-        let candidate = hit(
-            "h",
-            0.95,
-            0.95,
-            BTreeSet::new(),
-            Some("alpha"),
-            Some(hit_vector),
-        );
-        let query_context = Some(Context::new("alpha".to_owned()).unwrap());
-
-        let result = config.accept(
-            &BTreeSet::new(),
-            &query_context,
-            &Some(query_vector),
-            &candidate,
-        );
-        assert!(matches!(
-            result,
-            Err(Error::DimMismatch { got: 2, want: 3 })
-        ));
-    }
+    // --- select ---
 
     #[test]
     fn select_returns_none_when_all_rejected() {
         let config = ScoringConfig::default();
         let query = ents(&["a"]);
-        let hits = vec![make_hit("h", 0.50, ents(&["a"]), None)];
-        assert!(config.select(&query, &None, &None, hits).unwrap().is_none());
+        let hits = vec![hit("h", config.threshold - EPS, ents(&["a"]), 0.0)];
+        assert!(config.select(&query, &None, hits).unwrap().is_none());
     }
 
     #[test]
-    fn select_picks_highest_score_without_context() {
+    fn select_picks_highest_dense_score() {
         let config = ScoringConfig::default();
         let query = BTreeSet::<Entity>::new();
-        let low = make_hit("low", 0.90, BTreeSet::new(), None);
-        let high = make_hit("high", 0.95, BTreeSet::new(), None);
+        let low = hit("low", clears_dense(&config), BTreeSet::new(), 0.0);
+        let high = hit("high", 1.0, BTreeSet::new(), 0.0);
         let winner = config
-            .select(&query, &None, &None, vec![low, high.clone()])
+            .select(&query, &None, vec![low, high.clone()])
             .unwrap()
             .unwrap();
         assert_eq!(winner.id, high.id);
     }
 
     #[test]
-    fn tiebreak_breaks_near_ties_by_context_overlap() {
+    fn select_breaks_exact_tie_by_first_seen() {
+        // Two accepted hits with identical dense scores: select keeps the first in input order.
         let config = ScoringConfig::default();
         let query = BTreeSet::<Entity>::new();
-        let context = Some(Context::new("alpha beta gamma".to_owned()).unwrap());
-        let overlapping = make_hit("a", 0.95, BTreeSet::new(), Some("alpha beta"));
-        let disjoint = make_hit("b", 0.95, BTreeSet::new(), Some("delta epsilon"));
+        let first = hit("first", 1.0, BTreeSet::new(), 0.0);
+        let second = hit("second", 1.0, BTreeSet::new(), 0.0);
+        assert_ne!(first.id, second.id);
         let winner = config
-            .select(&query, &context, &None, vec![disjoint, overlapping.clone()])
+            .select(&query, &None, vec![first.clone(), second.clone()])
             .unwrap()
             .unwrap();
-        assert_eq!(winner.id, overlapping.id);
+        assert_eq!(winner.id, first.id);
     }
 
     #[test]
-    fn tiebreak_does_not_override_clear_score_lead() {
+    fn select_context_gate_filters_failing_context() {
+        // The higher-dense candidate misses the context gate (match below the bar) and is
+        // dropped; the lower-dense candidate whose context match clears the gate wins.
         let config = ScoringConfig::default();
         let query = BTreeSet::<Entity>::new();
-        let context = Some(Context::new("alpha beta gamma".to_owned()).unwrap());
-        let overlapping = make_hit("a", 0.95, BTreeSet::new(), Some("alpha beta"));
-        let higher = make_hit("b", 0.97, BTreeSet::new(), None);
+        let context = ctx("q");
+        let matching = hit(
+            "a",
+            clears_dense(&config),
+            BTreeSet::new(),
+            clears_gate(&config),
+        );
+        let failing = hit("b", 1.0, BTreeSet::new(), config.context_gate - EPS);
         let winner = config
-            .select(&query, &context, &None, vec![overlapping, higher.clone()])
+            .select(&query, &context, vec![failing, matching.clone()])
             .unwrap()
             .unwrap();
-        assert_eq!(winner.id, higher.id);
+        assert_eq!(winner.id, matching.id);
     }
 
     #[test]
-    fn ignore_mode_picks_highest_score_despite_context() {
+    fn ignore_mode_select_ignores_context() {
         let config = ScoringConfig {
             context: ContextMode::Ignore,
             ..ScoringConfig::default()
         };
         let query = BTreeSet::<Entity>::new();
-        let context = Some(Context::new("alpha beta".to_owned()).unwrap());
-        let overlapping = make_hit("a", 0.95, BTreeSet::new(), Some("alpha beta"));
-        let higher = make_hit("b", 0.96, BTreeSet::new(), None);
+        let context = ctx("q");
+        let matching = hit(
+            "a",
+            clears_dense(&config),
+            BTreeSet::new(),
+            clears_gate(&config),
+        );
+        let higher = hit("b", 1.0, BTreeSet::new(), 0.0);
         let winner = config
-            .select(&query, &context, &None, vec![overlapping, higher.clone()])
+            .select(&query, &context, vec![matching, higher.clone()])
             .unwrap()
             .unwrap();
         assert_eq!(winner.id, higher.id);

@@ -176,7 +176,7 @@ mod tests {
     fn job(cache: &Arc<DynCache>) -> WriteJob {
         let query = QueryText::new("q".to_owned()).unwrap();
         let keys = BTreeSet::new();
-        let id = EntryId::derive(&query, &keys);
+        let id = EntryId::derive(&query, &keys, &None);
         WriteJob {
             cache: cache.clone(),
             pending: Arc::new(PendingWrites::default()),
@@ -217,7 +217,7 @@ mod tests {
         let pending = Arc::new(PendingWrites::default());
         let query = QueryText::new("q".to_owned()).unwrap();
         let keys = BTreeSet::new();
-        let id = EntryId::derive(&query, &keys);
+        let id = EntryId::derive(&query, &keys, &None);
         let value: Arc<[u8]> = Arc::from(vec![9u8, 8, 7]);
         pending.insert(id, value.clone()).unwrap();
 
@@ -245,7 +245,7 @@ mod tests {
         let pending = Arc::new(PendingWrites::default());
         let query = QueryText::new("q".to_owned()).unwrap();
         let keys = BTreeSet::new();
-        let id = EntryId::derive(&query, &keys);
+        let id = EntryId::derive(&query, &keys, &None);
 
         let job = WriteJob {
             cache: cache.clone(),
@@ -271,7 +271,7 @@ mod tests {
         let pending = Arc::new(PendingWrites::default());
         let query = QueryText::new("q".to_owned()).unwrap();
         let keys = BTreeSet::new();
-        let id = EntryId::derive(&query, &keys);
+        let id = EntryId::derive(&query, &keys, &None);
         let v1: Arc<[u8]> = Arc::from(vec![1u8]);
         let v2: Arc<[u8]> = Arc::from(vec![2u8]);
 

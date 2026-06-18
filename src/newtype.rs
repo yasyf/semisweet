@@ -186,9 +186,22 @@ impl Embedding {
 pub struct EntryId([u8; 16]);
 
 impl EntryId {
-    pub fn derive(query: &QueryText, keys: &BTreeSet<Key>) -> Self {
+    /// Derives the content-addressed id from the query, optional context, and key set
+    /// together. Context is part of the identity: the same query and keys with a
+    /// different context derive a distinct id, so context variants are stored as
+    /// separate entries instead of overwriting one another. The context is injected
+    /// between the query and the keys with a one-byte presence tag, and every field is
+    /// length-prefixed, so no `(query, context, keys)` triple can collide with another.
+    pub fn derive(query: &QueryText, keys: &BTreeSet<Key>, context: &Option<Context>) -> Self {
         let mut buf: Vec<u8> = Vec::new();
         Self::push_field(&mut buf, query.as_str().as_bytes());
+        match context {
+            Some(context) => {
+                buf.push(1);
+                Self::push_field(&mut buf, context.as_str().as_bytes());
+            }
+            None => buf.push(0),
+        }
         for key in keys {
             Self::push_field(&mut buf, key.as_str().as_bytes());
         }
@@ -307,10 +320,74 @@ mod tests {
         let forward: BTreeSet<Key> = [a.clone(), b.clone()].into_iter().collect();
         let reverse: BTreeSet<Key> = [b, a].into_iter().collect();
 
-        let id1 = EntryId::derive(&query, &forward);
-        let id2 = EntryId::derive(&query, &reverse);
+        let id1 = EntryId::derive(&query, &forward, &None);
+        let id2 = EntryId::derive(&query, &reverse, &None);
         assert_eq!(id1, id2);
         assert_eq!(id1.to_string(), id2.to_string());
+    }
+
+    #[test]
+    fn entry_id_order_independent_with_context_present() {
+        let query = QueryText::new("what is the dose".to_owned()).unwrap();
+        let context = Some(Context::new("oncology".to_owned()).unwrap());
+        let a = Key::new("alpha".to_owned()).unwrap();
+        let b = Key::new("beta".to_owned()).unwrap();
+
+        let forward: BTreeSet<Key> = [a.clone(), b.clone()].into_iter().collect();
+        let reverse: BTreeSet<Key> = [b, a].into_iter().collect();
+
+        assert_eq!(
+            EntryId::derive(&query, &forward, &context),
+            EntryId::derive(&query, &reverse, &context)
+        );
+    }
+
+    #[test]
+    fn context_distinguishes_entries() {
+        let query = QueryText::new("what is the dose".to_owned()).unwrap();
+        let keys: BTreeSet<Key> = [Key::new("patient-7".to_owned()).unwrap()]
+            .into_iter()
+            .collect();
+        let context_a = Some(Context::new("a".to_owned()).unwrap());
+        let context_b = Some(Context::new("b".to_owned()).unwrap());
+
+        let none = EntryId::derive(&query, &keys, &None);
+        let a = EntryId::derive(&query, &keys, &context_a);
+        let b = EntryId::derive(&query, &keys, &context_b);
+
+        assert_ne!(none, a);
+        assert_ne!(none, b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn context_with_same_value_derives_equal_ids() {
+        let query = QueryText::new("what is the dose".to_owned()).unwrap();
+        let keys: BTreeSet<Key> = [Key::new("patient-7".to_owned()).unwrap()]
+            .into_iter()
+            .collect();
+        let context = Some(Context::new("oncology".to_owned()).unwrap());
+
+        assert_eq!(
+            EntryId::derive(&query, &keys, &context),
+            EntryId::derive(&query, &keys, &context)
+        );
+    }
+
+    #[test]
+    fn context_not_confused_with_key() {
+        let query = QueryText::new("dose".to_owned()).unwrap();
+        let k1 = Key::new("k1".to_owned()).unwrap();
+        let k2 = Key::new("k2".to_owned()).unwrap();
+
+        let two_keys: BTreeSet<Key> = [k1.clone(), k2.clone()].into_iter().collect();
+        let one_key: BTreeSet<Key> = [k1].into_iter().collect();
+        let context = Some(Context::new("k2".to_owned()).unwrap());
+
+        assert_ne!(
+            EntryId::derive(&query, &two_keys, &None),
+            EntryId::derive(&query, &one_key, &context)
+        );
     }
 
     #[test]
@@ -331,8 +408,8 @@ mod tests {
         .collect();
 
         assert_ne!(
-            EntryId::derive(&query, &split_first),
-            EntryId::derive(&query, &split_second)
+            EntryId::derive(&query, &split_first, &None),
+            EntryId::derive(&query, &split_second, &None)
         );
     }
 

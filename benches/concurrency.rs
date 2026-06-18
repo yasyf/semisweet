@@ -120,10 +120,9 @@ fn drive_cache(cache: &DynCache, threads: usize, per_thread: usize) {
                 for index in 0..per_thread {
                     let query = QueryText::new(format!("bench query {worker} item {index}"))
                         .expect("bench query");
-                    let keys: BTreeSet<Key> =
-                        [Key::new(format!("k{worker}")).expect("bench key")]
-                            .into_iter()
-                            .collect();
+                    let keys: BTreeSet<Key> = [Key::new(format!("k{worker}")).expect("bench key")]
+                        .into_iter()
+                        .collect();
                     let context: Option<Context> = None;
                     cache
                         .set(&query, &keys, &context, b"benchmark-value")

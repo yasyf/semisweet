@@ -11,7 +11,7 @@ async def roundtrip() -> object:
         embedding=semisweet.LocalEmbedding(),
         vectors=semisweet.MemoryVectors(),
         storage=semisweet.DiskStorage(),
-        scoring=semisweet.Scoring(base=0.9, floor=0.86),
+        scoring=semisweet.Scoring(threshold=0.9),
     )
     query = semisweet.CacheQuery(query="what is aspirin", keys={"patient1"})
     accepted: bool = await cache.set(query, {"drug": "aspirin", "class": "NSAID"})

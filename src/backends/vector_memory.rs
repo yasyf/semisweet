@@ -1,16 +1,17 @@
-//! In-memory `VectorStorageBackend` (std `RwLock`) — brute-force cosine search paired with a
-//! per-namespace BM25 lexical index for the sparse half of hybrid retrieval.
+//! In-memory `VectorStorageBackend` (std `RwLock`) — brute-force cosine retrieval paired with a
+//! per-namespace BM25 lexical index over stored contexts. Retrieval is dense-only; the context
+//! BM25 scores the query's context against each candidate's stored context for the context gate.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{PoisonError, RwLock};
 
 use crate::error::{Error, Result};
-use crate::newtype::{Dim, Embedding, EntryId, Namespace, QueryText};
+use crate::newtype::{Context, Dim, Embedding, EntryId, Namespace};
 use crate::vector::{Filter, ScoredHit, VectorEntry, VectorStorageBackend};
 
-const BM25_K1: f32 = 1.2;
-const BM25_B: f32 = 0.75;
+const DEFAULT_BM25_K1: f32 = 1.2;
+const DEFAULT_BM25_B: f32 = 0.75;
 
 fn tokenize(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -18,10 +19,18 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A per-namespace BM25 index over stored query texts. The backend already scans every entry
-/// for cosine, so no postings lists are needed — only the document-frequency, per-document
+/// Index `entry`'s context into `bm25`, keyed by its id; an entry with no context is left out
+/// of the index (it scores 0). `Bm25Index::insert` removes any prior posting for the id first,
+/// so re-upserting the same id stays idempotent.
+fn index_context(bm25: &mut Bm25Index, entry: &VectorEntry) {
+    if let Some(context) = &entry.context {
+        bm25.insert(entry.id, context.as_str());
+    }
+}
+
+/// A per-namespace BM25 index over stored contexts. The backend already scans every entry for
+/// cosine, so no postings lists are needed — only the document-frequency, per-document
 /// term-frequency, and length statistics BM25 needs to score a candidate it is already visiting.
-#[derive(Default)]
 struct Bm25Index {
     document_frequency: HashMap<String, usize>,
     term_frequency: HashMap<EntryId, HashMap<String, u32>>,
@@ -31,6 +40,16 @@ struct Bm25Index {
 }
 
 impl Bm25Index {
+    fn new() -> Self {
+        Self {
+            document_frequency: HashMap::new(),
+            term_frequency: HashMap::new(),
+            document_length: HashMap::new(),
+            total_length: 0,
+            document_count: 0,
+        }
+    }
+
     fn insert(&mut self, id: EntryId, text: &str) {
         self.remove(&id);
         let mut term_frequency: HashMap<String, u32> = HashMap::new();
@@ -84,11 +103,13 @@ impl Bm25Index {
         let mut upper_bound = 0.0f32;
         for term in query_terms {
             let idf = self.idf(term);
-            upper_bound += idf * (BM25_K1 + 1.0);
+            upper_bound += idf * (DEFAULT_BM25_K1 + 1.0);
             let tf = term_frequency.get(term).copied().unwrap_or(0) as f32;
             if tf > 0.0 {
-                let denominator = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * length / average_length);
-                numerator += idf * (tf * (BM25_K1 + 1.0)) / denominator;
+                let denominator = tf
+                    + DEFAULT_BM25_K1
+                        * (1.0 - DEFAULT_BM25_B + DEFAULT_BM25_B * length / average_length);
+                numerator += idf * (tf * (DEFAULT_BM25_K1 + 1.0)) / denominator;
             }
         }
         if upper_bound <= 0.0 {
@@ -134,15 +155,18 @@ impl VectorStorageBackend for MemoryVectorStore {
                         want: shard.dim.get(),
                     });
                 }
-                shard.bm25.insert(entry.id, entry.query_text.as_str());
+                index_context(&mut shard.bm25, &entry);
                 shard.entries.insert(entry.id, entry);
             }
             None => {
-                let mut entries = HashMap::new();
-                let mut bm25 = Bm25Index::default();
-                bm25.insert(entry.id, entry.query_text.as_str());
-                entries.insert(entry.id, entry);
-                shards.insert(ns.clone(), Shard { dim, entries, bm25 });
+                let mut shard = Shard {
+                    dim,
+                    entries: HashMap::new(),
+                    bm25: Bm25Index::new(),
+                };
+                index_context(&mut shard.bm25, &entry);
+                shard.entries.insert(entry.id, entry);
+                shards.insert(ns.clone(), shard);
             }
         }
         Ok(())
@@ -152,7 +176,7 @@ impl VectorStorageBackend for MemoryVectorStore {
         &self,
         ns: &Namespace,
         vector: &Embedding,
-        query_text: &QueryText,
+        query_context: Option<&Context>,
         filter: &Filter,
         top_k: NonZeroUsize,
     ) -> Result<Vec<ScoredHit>> {
@@ -166,7 +190,11 @@ impl VectorStorageBackend for MemoryVectorStore {
                 want: shard.dim.get(),
             });
         }
-        let query_terms: HashSet<String> = tokenize(query_text.as_str()).into_iter().collect();
+        // Retrieval is dense-only; the context BM25 only scores the query's context against each
+        // candidate's stored context, becoming the `sparse_score` gate signal. With no query
+        // context every candidate scores 0.
+        let context_terms: Option<HashSet<String>> =
+            query_context.map(|ctx| tokenize(ctx.as_str()).into_iter().collect());
         let mut hits: Vec<ScoredHit> = Vec::new();
         for entry in shard.entries.values() {
             if !filter.keys_all.is_subset(&entry.keys) {
@@ -176,33 +204,20 @@ impl VectorStorageBackend for MemoryVectorStore {
                 continue;
             }
             let dense_score = vector.dot(&entry.vector)?;
-            let sparse_score = shard.bm25.score(&entry.id, &query_terms);
+            let sparse_score = match &context_terms {
+                Some(terms) => shard.bm25.score(&entry.id, terms),
+                None => 0.0,
+            };
             hits.push(ScoredHit {
                 id: entry.id,
                 dense_score,
                 sparse_score,
                 entities: entry.entities.clone(),
                 context: entry.context.clone(),
-                context_vector: entry.context_vector.clone(),
             });
         }
-        // Return the union of each leg's top-k — the top-k by dense and the top-k by sparse among
-        // entries with any lexical overlap — mirroring turbopuffer's ANN ∪ BM25 multi-query. The
-        // weighted fusion that actually ranks these lives in `scoring`; truncating by either single
-        // axis (or by an unweighted sum) would bias against the other, so we keep both legs whole.
-        let k = top_k.get();
-        let keep: HashSet<EntryId> = {
-            let mut by_dense: Vec<&ScoredHit> = hits.iter().collect();
-            by_dense.sort_by(|a, b| b.dense_score.total_cmp(&a.dense_score));
-            let mut keep: HashSet<EntryId> = by_dense.iter().take(k).map(|hit| hit.id).collect();
-            let mut by_sparse: Vec<&ScoredHit> =
-                hits.iter().filter(|hit| hit.sparse_score > 0.0).collect();
-            by_sparse.sort_by(|a, b| b.sparse_score.total_cmp(&a.sparse_score));
-            keep.extend(by_sparse.iter().take(k).map(|hit| hit.id));
-            keep
-        };
-        hits.retain(|hit| keep.contains(&hit.id));
         hits.sort_by(|a, b| b.dense_score.total_cmp(&a.dense_score));
+        hits.truncate(top_k.get());
         Ok(hits)
     }
 
@@ -246,15 +261,14 @@ mod tests {
     ) -> VectorEntry {
         let query = QueryText::new(label.to_owned()).unwrap();
         let keys = keyset(keys);
-        let id = EntryId::derive(&query, &keys);
+        let context = context.map(|c| Context::new(c.to_owned()).unwrap());
+        let id = EntryId::derive(&query, &keys, &context);
         VectorEntry {
             id,
             vector: Embedding::new(vector).unwrap(),
-            query_text: query,
             keys,
             entities: entityset(entities),
-            context: context.map(|c| Context::new(c.to_owned()).unwrap()),
-            context_vector: None,
+            context,
         }
     }
 
@@ -262,17 +276,21 @@ mod tests {
         Namespace::new("prod".to_owned()).unwrap()
     }
 
-    fn qt(text: &str) -> QueryText {
-        QueryText::new(text.to_owned()).unwrap()
+    fn ctx(text: &str) -> Context {
+        Context::new(text.to_owned()).unwrap()
     }
 
     fn top_k(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
     }
 
+    fn store() -> MemoryVectorStore {
+        MemoryVectorStore::new()
+    }
+
     #[test]
     fn upsert_then_query_round_trip_orders_by_cosine() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let near = entry("near", vec![1.0, 0.0], &[], &[], None);
         let mid = entry("mid", vec![0.8, 0.6], &[], &[], None);
         let far = entry("far", vec![0.0, 1.0], &[], &[], None);
@@ -282,7 +300,7 @@ mod tests {
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
 
         assert_eq!(hits.len(), 3);
@@ -296,13 +314,13 @@ mod tests {
 
     #[test]
     fn query_returns_payload_metadata() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let e = entry("e", vec![1.0, 0.0], &[], &["aspirin"], Some("dosage info"));
         store.upsert(&ns(), e.clone()).unwrap();
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
 
         assert_eq!(hits.len(), 1);
@@ -315,7 +333,7 @@ mod tests {
 
     #[test]
     fn keys_all_filter_requires_all_keys_present() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let both = entry("both", vec![1.0, 0.0], &["a", "b"], &[], None);
         let only_a = entry("only_a", vec![1.0, 0.0], &["a"], &[], None);
         store.upsert(&ns(), both.clone()).unwrap();
@@ -325,28 +343,28 @@ mod tests {
 
         let filter_a = Filter::new(keyset(&["a"]), BTreeSet::new());
         let hits_a = store
-            .query(&ns(), &query, &qt("query"), &filter_a, top_k(10))
+            .query(&ns(), &query, None, &filter_a, top_k(10))
             .unwrap();
         let ids_a: HashSet<EntryId> = hits_a.iter().map(|h| h.id).collect();
         assert_eq!(ids_a, [both.id, only_a.id].into_iter().collect());
 
         let filter_ab = Filter::new(keyset(&["a", "b"]), BTreeSet::new());
         let hits_ab = store
-            .query(&ns(), &query, &qt("query"), &filter_ab, top_k(10))
+            .query(&ns(), &query, None, &filter_ab, top_k(10))
             .unwrap();
         assert_eq!(hits_ab.len(), 1);
         assert_eq!(hits_ab[0].id, both.id);
 
         let filter_ac = Filter::new(keyset(&["a", "c"]), BTreeSet::new());
         let hits_ac = store
-            .query(&ns(), &query, &qt("query"), &filter_ac, top_k(10))
+            .query(&ns(), &query, None, &filter_ac, top_k(10))
             .unwrap();
         assert!(hits_ac.is_empty());
     }
 
     #[test]
     fn entities_any_filter_matches_any_overlap() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let xy = entry("xy", vec![1.0, 0.0], &[], &["x", "y"], None);
         let z = entry("z", vec![1.0, 0.0], &[], &["z"], None);
         store.upsert(&ns(), xy.clone()).unwrap();
@@ -356,21 +374,21 @@ mod tests {
 
         let filter_x = Filter::new(BTreeSet::new(), entityset(&["x"]));
         let hits_x = store
-            .query(&ns(), &query, &qt("query"), &filter_x, top_k(10))
+            .query(&ns(), &query, None, &filter_x, top_k(10))
             .unwrap();
         assert_eq!(hits_x.len(), 1);
         assert_eq!(hits_x[0].id, xy.id);
 
         let filter_w = Filter::new(BTreeSet::new(), entityset(&["w"]));
         let hits_w = store
-            .query(&ns(), &query, &qt("query"), &filter_w, top_k(10))
+            .query(&ns(), &query, None, &filter_w, top_k(10))
             .unwrap();
         assert!(hits_w.is_empty());
     }
 
     #[test]
     fn empty_entities_any_imposes_no_entity_constraint() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let with = entry("with", vec![1.0, 0.0], &[], &["x"], None);
         let without = entry("without", vec![1.0, 0.0], &[], &[], None);
         store.upsert(&ns(), with.clone()).unwrap();
@@ -378,7 +396,7 @@ mod tests {
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
         let ids: HashSet<EntryId> = hits.iter().map(|h| h.id).collect();
         assert_eq!(ids, [with.id, without.id].into_iter().collect());
@@ -386,7 +404,7 @@ mod tests {
 
     #[test]
     fn top_k_truncates_to_highest_scoring() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let near = entry("near", vec![1.0, 0.0], &[], &[], None);
         let mid = entry("mid", vec![0.8, 0.6], &[], &[], None);
         let far = entry("far", vec![0.0, 1.0], &[], &[], None);
@@ -396,7 +414,7 @@ mod tests {
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(2))
+            .query(&ns(), &query, None, &Filter::default(), top_k(2))
             .unwrap();
 
         assert_eq!(hits.len(), 2);
@@ -406,7 +424,7 @@ mod tests {
 
     #[test]
     fn upsert_rejects_dim_mismatch() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         store
             .upsert(&ns(), entry("a", vec![1.0, 0.0], &[], &[], None))
             .unwrap();
@@ -418,27 +436,27 @@ mod tests {
 
     #[test]
     fn query_rejects_dim_mismatch() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         store
             .upsert(&ns(), entry("a", vec![1.0, 0.0], &[], &[], None))
             .unwrap();
         let query = Embedding::new(vec![1.0, 0.0, 0.0]).unwrap();
         let err = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap_err();
         assert!(matches!(err, Error::DimMismatch { got: 3, want: 2 }));
     }
 
     #[test]
     fn delete_removes_entry_so_query_misses() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let e = entry("e", vec![1.0, 0.0], &[], &[], None);
         store.upsert(&ns(), e.clone()).unwrap();
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         assert_eq!(
             store
-                .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+                .query(&ns(), &query, None, &Filter::default(), top_k(10))
                 .unwrap()
                 .len(),
             1
@@ -447,7 +465,7 @@ mod tests {
         store.delete(&ns(), &e.id).unwrap();
         assert!(
             store
-                .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+                .query(&ns(), &query, None, &Filter::default(), top_k(10))
                 .unwrap()
                 .is_empty()
         );
@@ -455,7 +473,7 @@ mod tests {
 
     #[test]
     fn delete_is_ok_for_absent_id_and_unknown_namespace() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let e = entry("e", vec![1.0, 0.0], &[], &[], None);
         store.delete(&ns(), &e.id).unwrap();
         store.upsert(&ns(), e.clone()).unwrap();
@@ -466,7 +484,7 @@ mod tests {
                 .query(
                     &ns(),
                     &Embedding::new(vec![1.0, 0.0]).unwrap(),
-                    &qt("query"),
+                    None,
                     &Filter::default(),
                     top_k(10)
                 )
@@ -478,16 +496,18 @@ mod tests {
 
     #[test]
     fn re_upsert_same_id_overwrites_vector_and_metadata() {
-        let store = MemoryVectorStore::new();
-        let first = entry("e", vec![0.0, 1.0], &["k"], &["old"], Some("old context"));
-        let second = entry("e", vec![1.0, 0.0], &["k"], &["new"], Some("new context"));
+        let store = store();
+        // Context is part of the identity, so an overwrite shares it; only the vector and
+        // the non-identity metadata (entities) change between the two upserts.
+        let first = entry("e", vec![0.0, 1.0], &["k"], &["old"], Some("context"));
+        let second = entry("e", vec![1.0, 0.0], &["k"], &["new"], Some("context"));
         assert_eq!(first.id, second.id);
         store.upsert(&ns(), first).unwrap();
         store.upsert(&ns(), second.clone()).unwrap();
 
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
 
         assert_eq!(hits.len(), 1);
@@ -496,32 +516,33 @@ mod tests {
         assert_eq!(hits[0].entities, entityset(&["new"]));
         assert_eq!(
             hits[0].context,
-            Some(Context::new("new context".to_owned()).unwrap())
+            Some(Context::new("context".to_owned()).unwrap())
         );
     }
 
     #[test]
     fn query_of_never_written_namespace_is_empty() {
-        let store = MemoryVectorStore::new();
+        let store = store();
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
         let hits = store
-            .query(&ns(), &query, &qt("query"), &Filter::default(), top_k(10))
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
         assert!(hits.is_empty());
     }
 
     #[test]
-    fn bm25_rarer_term_outranks_common_term() {
-        // Same vector for every doc, so dense ties and only the BM25 (IDF) signal separates
-        // them: the doc sharing the rare term `apple` must out-score the one sharing `fruit`.
-        let store = MemoryVectorStore::new();
-        let apple = entry("apple", vec![1.0, 0.0], &[], &[], None);
-        let fruit = entry("fruit", vec![1.0, 0.0], &[], &[], None);
+    fn context_bm25_rarer_term_outranks_common_term() {
+        // Same vector for every doc, so dense ties and only the context BM25 (IDF) signal
+        // separates them: the doc whose context shares the rare term `apple` must out-score the
+        // one whose context shares the common `fruit`.
+        let store = store();
+        let apple = entry("apple", vec![1.0, 0.0], &[], &[], Some("apple"));
+        let fruit = entry("fruit", vec![1.0, 0.0], &[], &[], Some("fruit"));
         store.upsert(&ns(), apple.clone()).unwrap();
         store.upsert(&ns(), fruit.clone()).unwrap();
         for filler in ["fruit red", "fruit green", "fruit yellow"] {
             store
-                .upsert(&ns(), entry(filler, vec![1.0, 0.0], &[], &[], None))
+                .upsert(&ns(), entry(filler, vec![1.0, 0.0], &[], &[], Some(filler)))
                 .unwrap();
         }
 
@@ -530,7 +551,7 @@ mod tests {
             .query(
                 &ns(),
                 &query,
-                &qt("apple fruit"),
+                Some(&ctx("apple fruit")),
                 &Filter::default(),
                 top_k(10),
             )
@@ -541,48 +562,63 @@ mod tests {
     }
 
     #[test]
-    fn bm25_sparse_is_zero_without_lexical_overlap() {
-        let store = MemoryVectorStore::new();
-        store
-            .upsert(&ns(), entry("aspirin dose", vec![1.0, 0.0], &[], &[], None))
-            .unwrap();
+    fn context_bm25_zero_without_term_overlap() {
+        // Both entries store a context, but only the one whose context shares a term with the
+        // query context scores above zero.
+        let store = store();
+        let aspirin = entry("a", vec![1.0, 0.0], &[], &[], Some("aspirin dose"));
+        let weather = entry("b", vec![1.0, 0.0], &[], &[], Some("weather forecast"));
+        store.upsert(&ns(), aspirin.clone()).unwrap();
+        store.upsert(&ns(), weather.clone()).unwrap();
+
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
-        let overlap = store
-            .query(&ns(), &query, &qt("aspirin"), &Filter::default(), top_k(10))
+        let hits = store
+            .query(
+                &ns(),
+                &query,
+                Some(&ctx("aspirin")),
+                &Filter::default(),
+                top_k(10),
+            )
             .unwrap();
-        let disjoint = store
-            .query(&ns(), &query, &qt("weather"), &Filter::default(), top_k(10))
-            .unwrap();
-        assert!(overlap[0].sparse_score > 0.0);
-        assert_eq!(disjoint[0].sparse_score, 0.0);
+        let sparse_of = |id: EntryId| hits.iter().find(|h| h.id == id).unwrap().sparse_score;
+        assert!(sparse_of(aspirin.id) > 0.0);
+        assert_eq!(sparse_of(weather.id), 0.0);
     }
 
     #[test]
-    fn bm25_reflects_reupsert_text_change() {
-        // Re-upserting the same id with new text must drop the old terms and index the new ones.
-        let store = MemoryVectorStore::new();
-        let id = EntryId::derive(&qt("alpha"), &BTreeSet::new());
-        let make = |text: &str| VectorEntry {
-            id,
-            vector: Embedding::new(vec![1.0, 0.0]).unwrap(),
-            query_text: qt(text),
-            keys: BTreeSet::new(),
-            entities: BTreeSet::new(),
-            context: None,
-            context_vector: None,
-        };
-        store.upsert(&ns(), make("alpha")).unwrap();
-        store.upsert(&ns(), make("beta gamma")).unwrap();
-
+    fn context_bm25_zero_when_query_or_entry_has_no_context() {
+        // No query context -> every candidate scores 0; a stored-context-less candidate scores 0
+        // even when the query carries a context.
+        let store = store();
+        let with_ctx = entry("a", vec![1.0, 0.0], &[], &[], Some("aspirin dose"));
+        let without_ctx = entry("b", vec![1.0, 0.0], &[], &[], None);
+        store.upsert(&ns(), with_ctx.clone()).unwrap();
+        store.upsert(&ns(), without_ctx.clone()).unwrap();
         let query = Embedding::new(vec![1.0, 0.0]).unwrap();
-        let hits_alpha = store
-            .query(&ns(), &query, &qt("alpha"), &Filter::default(), top_k(10))
+
+        let no_query_ctx = store
+            .query(&ns(), &query, None, &Filter::default(), top_k(10))
             .unwrap();
-        let hits_beta = store
-            .query(&ns(), &query, &qt("beta"), &Filter::default(), top_k(10))
+        assert!(no_query_ctx.iter().all(|h| h.sparse_score == 0.0));
+
+        let with_query_ctx = store
+            .query(
+                &ns(),
+                &query,
+                Some(&ctx("aspirin")),
+                &Filter::default(),
+                top_k(10),
+            )
             .unwrap();
-        assert_eq!(hits_alpha.len(), 1);
-        assert_eq!(hits_alpha[0].sparse_score, 0.0);
-        assert!(hits_beta[0].sparse_score > 0.0);
+        let sparse_of = |id: EntryId| {
+            with_query_ctx
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .sparse_score
+        };
+        assert!(sparse_of(with_ctx.id) > 0.0);
+        assert_eq!(sparse_of(without_ctx.id), 0.0);
     }
 }

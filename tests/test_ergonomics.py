@@ -73,7 +73,7 @@ def test_cache_queries_with_different_query_text_are_unequal():
 
 
 def test_scoring_equality_ignores_construction_order_and_hashes_equal():
-    a = Scoring(base=0.9, floor=0.8, top_k=5)
-    b = Scoring(base=0.9, floor=0.8, top_k=5)
+    a = Scoring(threshold=0.9, context_gate=0.2, top_k=5)
+    b = Scoring(threshold=0.9, context_gate=0.2, top_k=5)
     assert a == b
     assert hash(a) == hash(b)

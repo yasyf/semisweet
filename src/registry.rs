@@ -108,30 +108,24 @@ pub enum ObjectChoice {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoringDto {
-    pub base_threshold: f32,
-    pub floor_threshold: f32,
-    pub entity_bonus_weight: f32,
-    pub dense_weight: f32,
-    pub sparse_weight: f32,
-    pub context_bonus_weight: f32,
-    pub top_k: usize,
+    pub threshold: f32,
     pub entity_filter: bool,
     pub context: String,
+    pub context_gate: f32,
+    pub context_threshold: f32,
+    pub top_k: usize,
 }
 
 impl Default for ScoringDto {
     fn default() -> Self {
         let defaults = ScoringConfig::default();
         Self {
-            base_threshold: defaults.base_threshold,
-            floor_threshold: defaults.floor_threshold,
-            entity_bonus_weight: defaults.entity_bonus_weight,
-            dense_weight: defaults.dense_weight,
-            sparse_weight: defaults.sparse_weight,
-            context_bonus_weight: defaults.context_bonus_weight,
-            top_k: defaults.top_k.get(),
+            threshold: defaults.threshold,
             entity_filter: defaults.entity_filter,
             context: context_name(defaults.context).to_owned(),
+            context_gate: defaults.context_gate,
+            context_threshold: defaults.context_threshold,
+            top_k: defaults.top_k.get(),
         }
     }
 }
@@ -139,53 +133,41 @@ impl Default for ScoringDto {
 fn context_name(mode: ContextMode) -> &'static str {
     match mode {
         ContextMode::Ignore => "ignore",
-        ContextMode::Tiebreak => "tiebreak",
+        ContextMode::Gate => "gate",
     }
 }
 
 impl ScoringDto {
     pub(crate) fn to_config(&self) -> Result<ScoringConfig> {
-        if self.floor_threshold > self.base_threshold {
+        if !(0.0..=1.0).contains(&self.threshold) {
             return Err(Error::InvalidConfig(format!(
-                "floor_threshold {} exceeds base_threshold {}",
-                self.floor_threshold, self.base_threshold
+                "threshold {} must be finite and within 0.0..=1.0",
+                self.threshold
             )));
         }
-        if !(0.0..=1.0).contains(&self.base_threshold) {
+        if !(0.0..=1.0).contains(&self.context_gate) {
             return Err(Error::InvalidConfig(format!(
-                "base_threshold {} must be finite and within 0.0..=1.0",
-                self.base_threshold
+                "context_gate {} must be finite and within 0.0..=1.0",
+                self.context_gate
             )));
         }
-        if !(0.0..=1.0).contains(&self.floor_threshold) {
+        if !(0.0..=1.0).contains(&self.context_threshold) {
             return Err(Error::InvalidConfig(format!(
-                "floor_threshold {} must be finite and within 0.0..=1.0",
-                self.floor_threshold
+                "context_threshold {} must be finite and within 0.0..=1.0",
+                self.context_threshold
             )));
         }
-        for (name, weight) in [
-            ("entity_bonus_weight", self.entity_bonus_weight),
-            ("dense_weight", self.dense_weight),
-            ("sparse_weight", self.sparse_weight),
-            ("context_bonus_weight", self.context_bonus_weight),
-        ] {
-            if !weight.is_finite() || weight < 0.0 {
-                return Err(Error::InvalidConfig(format!(
-                    "{name} {weight} must be finite and >= 0.0"
-                )));
-            }
-        }
-        if self.dense_weight + self.sparse_weight <= 0.0 {
+        if self.context_threshold > self.threshold {
             return Err(Error::InvalidConfig(format!(
-                "dense_weight {} + sparse_weight {} must be > 0.0",
-                self.dense_weight, self.sparse_weight
+                "context_threshold {} must not exceed threshold {}",
+                self.context_threshold, self.threshold
             )));
         }
         let top_k = NonZeroUsize::new(self.top_k)
             .ok_or_else(|| Error::InvalidConfig("top_k must be greater than zero".to_owned()))?;
         let context = match self.context.as_str() {
             "ignore" => ContextMode::Ignore,
-            "tiebreak" => ContextMode::Tiebreak,
+            "gate" => ContextMode::Gate,
             other => {
                 return Err(Error::InvalidConfig(format!(
                     "unknown context mode `{other}`"
@@ -193,15 +175,12 @@ impl ScoringDto {
             }
         };
         Ok(ScoringConfig {
-            base_threshold: self.base_threshold,
-            floor_threshold: self.floor_threshold,
-            entity_bonus_weight: self.entity_bonus_weight,
-            dense_weight: self.dense_weight,
-            sparse_weight: self.sparse_weight,
-            context_bonus_weight: self.context_bonus_weight,
-            top_k,
+            threshold: self.threshold,
             entity_filter: self.entity_filter,
             context,
+            context_gate: self.context_gate,
+            context_threshold: self.context_threshold,
+            top_k,
         })
     }
 }
@@ -432,6 +411,10 @@ mod tests {
             serde_json::to_string(&VectorChoice::Turbopuffer).unwrap(),
             r#"{"kind":"turbopuffer"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&VectorChoice::Memory).unwrap(),
+            r#"{"kind":"memory"}"#
+        );
         let s3 = ObjectChoice::S3 {
             bucket: Some("b".to_owned()),
             region: Some("r".to_owned()),
@@ -472,45 +455,89 @@ mod tests {
 
     #[test]
     fn scoring_rejects_nan_and_out_of_range() {
-        let nan_base = ScoringDto {
-            base_threshold: f32::NAN,
-            ..ScoringDto::default()
-        };
-        assert!(matches!(nan_base.to_config(), Err(Error::InvalidConfig(_))));
-
-        let nan_floor = ScoringDto {
-            floor_threshold: f32::NAN,
+        let nan_threshold = ScoringDto {
+            threshold: f32::NAN,
             ..ScoringDto::default()
         };
         assert!(matches!(
-            nan_floor.to_config(),
+            nan_threshold.to_config(),
             Err(Error::InvalidConfig(_))
         ));
 
-        let base_over_one = ScoringDto {
-            base_threshold: 1.5,
+        let threshold_over_one = ScoringDto {
+            threshold: 1.5,
             ..ScoringDto::default()
         };
         assert!(matches!(
-            base_over_one.to_config(),
+            threshold_over_one.to_config(),
             Err(Error::InvalidConfig(_))
         ));
 
-        let negative_weight = ScoringDto {
-            entity_bonus_weight: -0.1,
+        let nan_gate = ScoringDto {
+            context_gate: f32::NAN,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(nan_gate.to_config(), Err(Error::InvalidConfig(_))));
+
+        let gate_over_one = ScoringDto {
+            context_gate: 1.5,
             ..ScoringDto::default()
         };
         assert!(matches!(
-            negative_weight.to_config(),
+            gate_over_one.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let nan_context_threshold = ScoringDto {
+            context_threshold: f32::NAN,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            nan_context_threshold.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let zero_top_k = ScoringDto {
+            top_k: 0,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            zero_top_k.to_config(),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let unknown_context = ScoringDto {
+            context: "bogus".to_owned(),
+            ..ScoringDto::default()
+        };
+        assert!(matches!(
+            unknown_context.to_config(),
             Err(Error::InvalidConfig(_))
         ));
     }
 
     #[test]
-    fn build_cache_rejects_floor_above_base() {
+    fn scoring_rejects_context_threshold_above_threshold() {
+        // The context-present dense floor must never sit above the full threshold; an
+        // inverted pair is rejected even though both values are individually in range.
+        let inverted = ScoringDto {
+            threshold: 0.80,
+            context_threshold: 0.90,
+            ..ScoringDto::default()
+        };
+        assert!(matches!(inverted.to_config(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn memory_choice_deserializes_from_kind_tag() {
+        let choice: VectorChoice = serde_json::from_str(r#"{"kind":"memory"}"#).unwrap();
+        assert_eq!(choice, VectorChoice::Memory);
+    }
+
+    #[test]
+    fn build_cache_rejects_threshold_out_of_range() {
         let mut config = offline_config("/tmp/unused");
-        config.scoring.base_threshold = 0.90;
-        config.scoring.floor_threshold = 0.95;
+        config.scoring.threshold = 1.5;
         assert!(matches!(
             build_cache("clinical", &config),
             Err(Error::InvalidConfig(_))

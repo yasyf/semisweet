@@ -65,12 +65,6 @@ where
     ) -> Result<Option<ScoredHit>> {
         let entities = self.extract_entities(query, context, true)?;
         let embedding = self.embedding.embed_query(query.as_str())?;
-        let context_vector = match context {
-            Some(context) if self.scoring.uses_context_dense() => {
-                Some(self.embedding.embed_query(context.as_str())?)
-            }
-            _ => None,
-        };
         let filter = Filter {
             keys_all: keys.clone(),
             entities_any: if self.scoring.entity_filter {
@@ -82,12 +76,11 @@ where
         let hits = self.vector.query(
             &self.namespace,
             &embedding,
-            query,
+            context.as_ref(),
             &filter,
             self.scoring.top_k,
         )?;
-        self.scoring
-            .select(&entities, context, &context_vector, hits)
+        self.scoring.select(&entities, context, hits)
     }
 
     pub fn get(
@@ -124,18 +117,12 @@ where
     ) -> Result<VectorEntry> {
         let entities = self.extract_entities(query, context, false)?;
         let embedding = self.embedding.embed_query(query.as_str())?;
-        let context_vector = match context {
-            Some(context) => Some(self.embedding.embed_query(context.as_str())?),
-            None => None,
-        };
         Ok(VectorEntry {
-            id: EntryId::derive(query, keys),
+            id: EntryId::derive(query, keys, context),
             vector: embedding,
-            query_text: query.clone(),
             keys: keys.clone(),
             entities,
             context: context.clone(),
-            context_vector,
         })
     }
 
@@ -197,11 +184,17 @@ mod tests {
         QueryText::new(text.to_owned()).unwrap()
     }
 
-    /// A stand-in for the backends' BM25: token Jaccard of the query against the stored query
-    /// text, in `[0, 1]`. Identical text scores 1.0 so an exact-match GET fuses high enough to
-    /// clear the recalibrated threshold.
-    fn jaccard(query_tokens: &BTreeSet<&str>, doc: &str) -> f32 {
-        let doc_tokens: BTreeSet<&str> = doc.split_whitespace().collect();
+    /// A stand-in for the backends' context BM25: token Jaccard of the query context against
+    /// the stored context, in `[0, 1]`. Zero when either side carries no context; identical
+    /// contexts score 1.0, clearing the context gate.
+    fn context_jaccard(
+        query_tokens: Option<&BTreeSet<&str>>,
+        entry_context: &Option<Context>,
+    ) -> f32 {
+        let (Some(query_tokens), Some(entry_context)) = (query_tokens, entry_context) else {
+            return 0.0;
+        };
+        let doc_tokens: BTreeSet<&str> = entry_context.as_str().split_whitespace().collect();
         if query_tokens.is_empty() || doc_tokens.is_empty() {
             return 0.0;
         }
@@ -304,7 +297,7 @@ mod tests {
             &self,
             ns: &Namespace,
             vector: &Embedding,
-            query_text: &QueryText,
+            query_context: Option<&Context>,
             filter: &Filter,
             top_k: std::num::NonZeroUsize,
         ) -> Result<Vec<ScoredHit>> {
@@ -312,7 +305,8 @@ mod tests {
             let Some(entries) = store.get(ns) else {
                 return Ok(Vec::new());
             };
-            let query_tokens: BTreeSet<&str> = query_text.as_str().split_whitespace().collect();
+            let query_tokens: Option<BTreeSet<&str>> =
+                query_context.map(|ctx| ctx.as_str().split_whitespace().collect());
             let mut hits: Vec<ScoredHit> = entries
                 .values()
                 .filter(|entry| filter.keys_all.is_subset(&entry.keys))
@@ -323,15 +317,12 @@ mod tests {
                 .map(|entry| ScoredHit {
                     id: entry.id,
                     dense_score: vector.dot(&entry.vector).unwrap(),
-                    sparse_score: jaccard(&query_tokens, entry.query_text.as_str()),
+                    sparse_score: context_jaccard(query_tokens.as_ref(), &entry.context),
                     entities: entry.entities.clone(),
                     context: entry.context.clone(),
-                    context_vector: entry.context_vector.clone(),
                 })
                 .collect();
-            hits.sort_by(|a, b| {
-                (b.dense_score + b.sparse_score).total_cmp(&(a.dense_score + a.sparse_score))
-            });
+            hits.sort_by(|a, b| b.dense_score.total_cmp(&a.dense_score));
             hits.truncate(top_k.get());
             Ok(hits)
         }
@@ -453,7 +444,7 @@ mod tests {
         );
         let q = query("what is aspirin");
         let keys = keyset(&["patient1"]);
-        let id = EntryId::derive(&q, &keys);
+        let id = EntryId::derive(&q, &keys, &None);
 
         cache.set(&q, &keys, &None, b"answer").unwrap();
         assert_eq!(
@@ -478,7 +469,7 @@ mod tests {
         );
         let q = query("what is aspirin");
         let keys = keyset(&["patient1"]);
-        let id = EntryId::derive(&q, &keys);
+        let id = EntryId::derive(&q, &keys, &None);
 
         cache.set(&q, &keys, &None, b"answer").unwrap();
         object.remove_object(&namespace(), &id);
@@ -495,7 +486,7 @@ mod tests {
         );
         let q = query("interaction query");
         let keys = keyset(&["patient1"]);
-        let id = EntryId::derive(&q, &keys);
+        let id = EntryId::derive(&q, &keys, &None);
 
         cache.set(&q, &keys, &None, b"payload").unwrap();
 
