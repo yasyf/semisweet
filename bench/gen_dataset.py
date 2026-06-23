@@ -39,7 +39,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 import random
 import subprocess
 import sys
@@ -50,10 +49,9 @@ import numpy as np
 from pydantic import BaseModel, Field
 from spawnllm import (
     ClaudeCliBackend,
+    RunSpec,
     map_concurrent,
-    resolve_schema_path,
-    run_cli,
-    schema_for,
+    run_sync,
 )
 
 from bench.common import (
@@ -75,8 +73,6 @@ from bench.common import (
 SCHEMA_VERSION = 1
 DATA_ROOT = Path(__file__).resolve().parent / "data"
 
-# spawnllm.call() hardcodes run_cli's 30s timeout, which an opus structured-output cluster
-# routinely exceeds; we reuse spawnllm's structured-output building blocks with a longer one.
 LLM_TIMEOUT_SECS = 240
 LLM_CONCURRENCY = 4
 
@@ -935,10 +931,16 @@ def _author_prompt(index: int, theme: str) -> str:
 
 def _structured_call(prompt: str, model: str) -> ClusterDraft:
     backend = ClaudeCliBackend()
-    schema_path = resolve_schema_path(backend, schema_for(ClusterDraft))
-    cmd = backend.build_command(backend.models[model], schema_path, agent=False)
-    raw = run_cli(cmd, input=prompt, env=os.environ | backend.env(), timeout=LLM_TIMEOUT_SECS)
-    result = backend.parse_response(raw, ClusterDraft)
+    rr = run_sync(
+        RunSpec(
+            prompt=prompt,
+            model=backend.models[model],
+            schema=backend.schema_for(ClusterDraft),
+            timeout=LLM_TIMEOUT_SECS,
+        ),
+        backend=backend,
+    )
+    result = backend.parse_response(rr.stdout, ClusterDraft)
     assert isinstance(result, ClusterDraft)
     return result
 
