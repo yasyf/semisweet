@@ -49,10 +49,9 @@ import numpy as np
 from pydantic import BaseModel, Field
 from spawnllm import (
     ClaudeCliBackend,
-    RunSpec,
-    map_concurrent,
-    run_sync,
+    extract_sync,
 )
+from spawnllm.proc import map_concurrent
 
 from bench.common import (
     BGE_DIM,
@@ -930,19 +929,13 @@ def _author_prompt(index: int, theme: str) -> str:
 
 
 def _structured_call(prompt: str, model: str) -> ClusterDraft:
-    backend = ClaudeCliBackend()
-    rr = run_sync(
-        RunSpec(
-            prompt=prompt,
-            model=backend.models[model],
-            schema=backend.schema_for(ClusterDraft),
-            timeout=LLM_TIMEOUT_SECS,
-        ),
-        backend=backend,
+    return extract_sync(
+        prompt,
+        ClusterDraft,
+        backend=ClaudeCliBackend(),
+        model=model,
+        timeout=LLM_TIMEOUT_SECS,
     )
-    result = backend.parse_response(rr.stdout, ClusterDraft)
-    assert isinstance(result, ClusterDraft)
-    return result
 
 
 def _cache_key(version: str, index: int, seed: int) -> str:
