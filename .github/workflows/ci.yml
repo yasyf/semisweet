@@ -25,7 +25,7 @@ jobs:
     name: rust (fmt + clippy + test, all features)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -65,7 +65,7 @@ jobs:
     name: python (maturin build + import smoke + offline pytest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
 
@@ -100,7 +100,7 @@ jobs:
     # Non-blocking: a flaky HF model download must not fail the required surface.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
 
@@ -115,7 +115,7 @@ jobs:
       # tests/test_python_api.py hardcodes this path; @needs_model skips when it is
       # absent. Cache it so a warm run never re-downloads BGE.
       - name: cache BGE model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .fastembed_cache
           key: bge-small-en-v1.5-v1
@@ -149,7 +149,7 @@ jobs:
     # Non-blocking: container pull/startup is an external dependency.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
 
@@ -175,7 +175,7 @@ jobs:
     # Non-blocking: depends on the BGE model download.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
 
@@ -188,7 +188,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cache BGE model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .fastembed_cache
           key: bge-small-en-v1.5-v1
@@ -205,7 +205,7 @@ jobs:
     # Non-blocking: depends on the GLiNER model download from the Hugging Face Hub.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.90.0
 
@@ -218,7 +218,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cache GLiNER model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .hf_home
           key: gliner-small-v2.1-v1
