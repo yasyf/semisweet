@@ -93,6 +93,8 @@ Reach for **`Grep`** only for material neither tool indexes: literal *content* o
 
 ## Style
 
+**Comments are terse and used sparingly — the code documents itself** through names, types, and organization. The one exception is documentation-generation comments: `///` rustdoc on public items (and `//!` module docs), each a real description rather than a restatement of the signature. Beyond rustdoc, comment only for TODOs, non-obvious workarounds, or disabled code.
+
 @STYLEGUIDE.md
 
 ## General Rules
