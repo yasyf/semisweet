@@ -4,4 +4,7 @@ source = "github:yasyf/cc-notes@latest"
 [packs.general]
 
 
+[packs.python]
+
+
 [packs.steering]

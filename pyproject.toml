@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "semisweet"
-description = "An async, in-memory semantic cache with pluggable backends."
+description = "Stop paying for answers you already have."
 readme = "README.md"
 # Matches the abi3-py39 floor in Cargo.toml. No upper cap: a stable-ABI wheel is
 # forward-compatible (runs on 3.9 through 3.14+).
