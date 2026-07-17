@@ -1,5 +1,6 @@
 fragments = [
   "semisweet-guide",
+  "cc-skills:ccx",
 ]
 
 [sources.cc-skills]
