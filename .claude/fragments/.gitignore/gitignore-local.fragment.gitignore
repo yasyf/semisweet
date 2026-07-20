@@ -1,0 +1,12 @@
+# Rust
+/target
+# Cargo.lock is intentionally committed (this crate ships a wheel; reproducible
+# builds) — do not ignore it.
+
+# Downloaded model caches (regenerable; fastembed/ONNX weights)
+.fastembed_cache/
+
+# Benchmark harness: generated datasets and sweep results (regenerable via
+# `python -m bench.gen_dataset`); the harness code under bench/ is committed, the data is not.
+/bench/data/
+/bench/results/
