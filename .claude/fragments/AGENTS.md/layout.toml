@@ -1,6 +1,12 @@
 fragments = [
   "semisweet-guide",
+  "cc-skills:ask-before-assuming",
+  "cc-skills:code-review-response",
+  "cc-skills:parallelize",
+  "cc-skills:writing-plans",
   "cc-skills:ccx",
+  "semisweet-style",
+  "cc-skills:version-control",
 ]
 
 [sources.cc-skills]
