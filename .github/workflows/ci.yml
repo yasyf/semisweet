@@ -24,6 +24,7 @@ jobs:
   rust:
     name: rust (fmt + clippy + test, all features)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -64,6 +65,7 @@ jobs:
   python:
     name: python (maturin build + import smoke + offline pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -97,6 +99,7 @@ jobs:
   python-model-e2e:
     name: python model e2e (BGE-backed pytest) [non-blocking]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Non-blocking: a flaky HF model download must not fail the required surface.
     continue-on-error: true
     steps:
@@ -146,6 +149,7 @@ jobs:
   rust-s3-minio:
     name: rust s3 e2e (MinIO via testcontainers) [non-blocking]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Non-blocking: container pull/startup is an external dependency.
     continue-on-error: true
     steps:
@@ -172,6 +176,7 @@ jobs:
   rust-model-e2e:
     name: rust model e2e (daemon serving over BGE) [non-blocking]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Non-blocking: depends on the BGE model download.
     continue-on-error: true
     steps:
@@ -202,6 +207,7 @@ jobs:
   rust-gliner-e2e:
     name: rust gliner e2e (HF auto-download) [non-blocking]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Non-blocking: depends on the GLiNER model download from the Hugging Face Hub.
     continue-on-error: true
     steps:
